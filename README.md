@@ -1,6 +1,6 @@
 # AI Data Analyst - 通用结构化数据分析与可视化系统
 
-基于LLMToolCalling架构的企业级AI数据分析系统。
+基于Langchain架构的企业级AI数据分析系统。
 
 ## 核心特性
 
