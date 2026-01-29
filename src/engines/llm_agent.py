@@ -1,6 +1,7 @@
 """LLM Agent - Tool Calling 循环（正确版本）"""
 
 import json
+import re
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
@@ -8,6 +9,8 @@ from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
+from openai import APIError as OpenAIAPIError, BadRequestError as OpenAIBadRequestError
+from anthropic import APIError as AnthropicAPIError, BadRequestError as AnthropicBadRequestError
 
 from src.core.config import settings
 from src.engines.tool_executor import get_tool_executor
@@ -71,6 +74,52 @@ class LLMAgent:
         except Exception as e:
             log.error(f"绑定工具失败: {e}")
             raise
+
+    def _parse_api_error(self, error: Exception, provider: str) -> str:
+        """解析 API 错误信息，提取用户友好的错误消息"""
+        error_str = str(error)
+
+        # 尝试解析 JSON 错误信息
+        try:
+            # 匹配 JSON 格式的错误
+            json_match = re.search(r"\{.*\}", error_str, re.DOTALL)
+            if json_match:
+                error_json = json.loads(json_match.group())
+                if 'error' in error_json:
+                    err = error_json['error']
+                    code = err.get('code', 'unknown')
+                    message = err.get('message', str(error))
+                    error_type = err.get('type', '')
+
+                    # 内容过滤错误
+                    if code == 400 and 'content_filter' in error_type:
+                        return f"请求被内容安全过滤器拒绝: {message}"
+                    elif 'rate_limit' in error_type.lower():
+                        return f"API 请求频率超限，请稍后重试"
+                    elif 'invalid_api_key' in error_type.lower():
+                        return f"{provider} API Key 无效"
+                    elif 'insufficient_quota' in error_type.lower():
+                        return f"{provider} API 额度不足"
+                    else:
+                        return f"{provider} API 错误 ({code}): {message}"
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+        # 常见错误模式匹配
+        if 'content_filter' in error_str.lower() or 'high risk' in error_str.lower():
+            return "请求被内容安全过滤器拒绝，请尝试修改问题描述"
+        elif 'rate limit' in error_str.lower():
+            return "API 请求频率超限，请稍后重试"
+        elif 'invalid api key' in error_str.lower() or 'authentication' in error_str.lower():
+            return f"{provider} API Key 无效或未配置"
+        elif 'quota' in error_str.lower() or 'billing' in error_str.lower():
+            return f"{provider} API 额度不足，请检查账户余额"
+        elif 'timeout' in error_str.lower():
+            return "API 请求超时，请重试"
+        elif 'connection' in error_str.lower():
+            return "无法连接到 API 服务，请检查网络"
+
+        return f"{provider} API 错误: {error_str[:200]}"
 
     def _create_llm(self, config: Optional[Dict[str, Any]] = None):
         """创建 LLM 实例"""
@@ -275,7 +324,41 @@ class LLMAgent:
                 last_msg = messages[-1]
                 log.info(f"最后一条消息类型: {type(last_msg).__name__}")
 
-            response = self.llm_with_tools.invoke(messages)
+            try:
+                response = self.llm_with_tools.invoke(messages)
+            except (OpenAIBadRequestError, OpenAIAPIError) as e:
+                error_msg = self._parse_api_error(e, "OpenAI")
+                log.error(f"OpenAI API 错误: {error_msg}")
+                return {
+                    "answer": None,
+                    "charts": [],
+                    "tables": [],
+                    "trace": trace.to_dict(),
+                    "steps": step + 1,
+                    "error": error_msg
+                }
+            except (AnthropicBadRequestError, AnthropicAPIError) as e:
+                error_msg = self._parse_api_error(e, "Anthropic")
+                log.error(f"Anthropic API 错误: {error_msg}")
+                return {
+                    "answer": None,
+                    "charts": [],
+                    "tables": [],
+                    "trace": trace.to_dict(),
+                    "steps": step + 1,
+                    "error": error_msg
+                }
+            except Exception as e:
+                error_msg = f"LLM 调用失败: {str(e)}"
+                log.error(error_msg)
+                return {
+                    "answer": None,
+                    "charts": [],
+                    "tables": [],
+                    "trace": trace.to_dict(),
+                    "steps": step + 1,
+                    "error": error_msg
+                }
 
             # 提取 token 使用量
             if hasattr(response, 'response_metadata'):
@@ -421,7 +504,35 @@ class StreamingLLMAgent(LLMAgent):
             # 发送步骤开始事件
             yield {"type": "step_start", "step": step + 1, "max_steps": self.max_steps}
 
-            response = self.llm_with_tools.invoke(messages)
+            try:
+                response = self.llm_with_tools.invoke(messages)
+            except (OpenAIBadRequestError, OpenAIAPIError) as e:
+                error_msg = self._parse_api_error(e, "OpenAI")
+                log.error(f"OpenAI API 错误: {error_msg}")
+                yield {
+                    "type": "error",
+                    "error": error_msg,
+                    "trace": trace.to_dict()
+                }
+                return
+            except (AnthropicBadRequestError, AnthropicAPIError) as e:
+                error_msg = self._parse_api_error(e, "Anthropic")
+                log.error(f"Anthropic API 错误: {error_msg}")
+                yield {
+                    "type": "error",
+                    "error": error_msg,
+                    "trace": trace.to_dict()
+                }
+                return
+            except Exception as e:
+                error_msg = f"LLM 调用失败: {str(e)}"
+                log.error(error_msg)
+                yield {
+                    "type": "error",
+                    "error": error_msg,
+                    "trace": trace.to_dict()
+                }
+                return
 
             # 提取 token 使用量
             if hasattr(response, 'response_metadata'):
