@@ -7,13 +7,15 @@ const ChartDisplay = ({ chart }) => {
   }
 
   return (
-    <ReactECharts
-      option={chart.option}
-      style={{ height: '400px', width: '100%' }}
-      notMerge={true}
-      lazyUpdate={true}
-      theme={"macarons"} 
-    />
+    <div className="chart-container-wrapper">
+      <ReactECharts
+        option={chart.option}
+        style={{ height: '400px', width: '100%' }}
+        notMerge={true}
+        lazyUpdate={true}
+        theme={"macarons"} 
+      />
+    </div>
   );
 };
 
