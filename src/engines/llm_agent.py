@@ -1,0 +1,549 @@
+"""LLM Agent - Tool Calling 循环（正确版本）"""
+
+import json
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+
+from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
+
+from src.core.config import settings
+from src.engines.tool_executor import get_tool_executor
+from src.utils.logger import log
+from src.utils.trace import TraceContext, StepLog
+
+
+# System Prompt
+SYSTEM_PROMPT = """你是一个数据分析规划助手。
+
+你的任务是帮助用户分析结构化数据（Excel/CSV），并回答用户的问题。
+
+重要规则：
+1. 你不能直接计算数据，不能编造数据
+2. 你必须先调用 get_schema 工具了解数据结构
+3. 所有计算必须通过 run_query 工具完成
+4. 所有结论必须基于工具返回的结果
+5. 不要猜测，必须使用工具获取真实数据
+6. 当用户需要图表或可视化时，必须调用 plot 工具生成图表
+7. 如果用户提到的字段名与数据集字段不完全匹配，使用 resolve_fields 工具进行语义映射
+
+工作流程：
+1. 先调用 get_schema 了解数据集的字段结构
+2. 如果用户提到的字段名不明确，调用 resolve_fields 进行字段映射
+3. 然后调用 run_query 进行数据查询和计算
+4. 如果用户需要图表，调用 plot 工具生成可视化
+5. 基于查询结果给出答案
+
+注意：
+- 必须调用工具，不要凭空回答
+- run_query 的 aggregations 参数是列表，每个元素包含 as, agg, col 三个字段
+- plot 工具需要传入 run_query 返回的数据
+- resolve_fields 可以帮助你找到用户意图对应的真实字段名
+"""
+
+
+class LLMAgent:
+    """LLM Agent"""
+
+    def __init__(self, llm_config: Optional[Dict[str, Any]] = None):
+        self.tool_executor = get_tool_executor()
+        self.max_steps = settings.max_tool_steps
+        self.llm = self._create_llm(llm_config)
+
+        # 创建工具
+        self.tools = self._create_tools()
+
+        # 调试：打印工具信息
+        log.info(f"创建了 {len(self.tools)} 个工具:")
+        for t in self.tools:
+            log.info(f"  - {t.name}: {t.description[:50]}...")
+
+        # 绑定工具并验证
+        try:
+            self.llm_with_tools = self.llm.bind_tools(self.tools)
+            log.info("工具已绑定到 LLM")
+
+            # 打印绑定后的工具信息（用于调试）
+            if hasattr(self.llm_with_tools, 'kwargs') and 'tools' in self.llm_with_tools.kwargs:
+                log.info(f"绑定的工具格式: {json.dumps(self.llm_with_tools.kwargs['tools'], ensure_ascii=False, indent=2)}")
+        except Exception as e:
+            log.error(f"绑定工具失败: {e}")
+            raise
+
+    def _create_llm(self, config: Optional[Dict[str, Any]] = None):
+        """创建 LLM 实例"""
+        provider = config.get("provider") if config else settings.default_llm_provider
+        api_key = config.get("api_key") if config else None
+        model = config.get("model") if config else settings.default_model
+        base_url = config.get("base_url") if config else None
+
+        if not api_key:
+            if provider == "openai":
+                api_key = settings.openai_api_key
+            elif provider == "anthropic":
+                api_key = settings.anthropic_api_key
+
+        if not api_key:
+            raise ValueError(f"未配置 {provider} 的 API Key")
+
+        log.info(f"初始化 LLM: provider={provider}, model={model}, base_url={base_url}")
+
+        if provider == "openai":
+            llm_kwargs = {
+                "model": model,
+                "api_key": api_key,
+                "temperature": 0,
+                "model_kwargs": {
+                    # 确保启用 function calling
+                    "parallel_tool_calls": True,
+                }
+            }
+            if base_url:
+                llm_kwargs["base_url"] = base_url
+
+            llm = ChatOpenAI(**llm_kwargs)
+
+            # 验证模型是否支持工具调用
+            try:
+                test_tools = [{"type": "function", "function": {"name": "test", "description": "test", "parameters": {"type": "object", "properties": {}}}}]
+                llm.bind_tools(test_tools)
+                log.info("模型支持工具调用")
+            except Exception as e:
+                log.warning(f"模型可能不支持工具调用: {e}")
+
+            return llm
+        elif provider == "anthropic":
+            llm_kwargs = {
+                "model": model,
+                "api_key": api_key,
+                "temperature": 0
+            }
+            if base_url:
+                llm_kwargs["base_url"] = base_url
+            return ChatAnthropic(**llm_kwargs)
+        else:
+            raise ValueError(f"不支持的 LLM 提供商: {provider}")
+
+    def _create_tools(self):
+        """创建工具列表"""
+        tool_executor = self.tool_executor
+
+        @tool
+        def get_schema(dataset_id: str) -> dict:
+            """获取数据集的字段结构和统计信息
+
+            Args:
+                dataset_id: 数据集ID
+
+            Returns:
+                包含字段信息的字典
+            """
+            return tool_executor.execute("get_schema", {"dataset_id": dataset_id})
+
+        @tool
+        def sample_rows(dataset_id: str, n: int = 5) -> dict:
+            """获取数据集的样本行
+
+            Args:
+                dataset_id: 数据集ID
+                n: 返回行数，默认5行
+
+            Returns:
+                样本数据
+            """
+            return tool_executor.execute("sample_rows", {
+                "dataset_id": dataset_id,
+                "n": n,
+                "columns": None
+            })
+
+        @tool
+        def run_query(
+            dataset_id: str,
+            group_by: List[str] = None,
+            aggregations: List[dict] = None,
+            filters: List[dict] = None,
+            sort: List[dict] = None,
+            limit: int = 1000
+        ) -> dict:
+            """执行数据查询和聚合
+
+            Args:
+                dataset_id: 数据集ID
+                group_by: 分组列名列表，例如 ["账号", "月份"]
+                aggregations: 聚合操作列表，每个包含 as, agg, col 三个字段
+                    例如: [{"as": "退货总数", "agg": "sum", "col": "退货数量"}]
+                    支持的聚合函数: sum, avg, min, max, count, nunique
+                filters: 过滤条件列表，每个包含 col, op, value
+                    例如: [{"col": "年份", "op": "=", "value": 2025}]
+                sort: 排序规则列表，每个包含 col, dir
+                    例如: [{"col": "退货总数", "dir": "desc"}]
+                limit: 返回行数限制
+
+            Returns:
+                查询结果，包含 columns 和 rows
+            """
+            return tool_executor.execute("run_query", {
+                "dataset_id": dataset_id,
+                "filters": filters or [],
+                "group_by": group_by or [],
+                "aggregations": aggregations or [],
+                "derived": [],
+                "sort": sort or [],
+                "limit": limit
+            })
+
+        @tool
+        def plot(
+            chart_type: str,
+            title: str,
+            data: List[dict],
+            x: str = None,
+            y: str = None,
+            series: str = None,
+            y_format: str = "number"
+        ) -> dict:
+            """生成数据可视化图表
+
+            Args:
+                chart_type: 图表类型，支持 line(折线图), bar(柱状图), pie(饼图), scatter(散点图), area(面积图)
+                title: 图表标题
+                data: 图表数据，来自 run_query 的结果 rows
+                x: X轴列名（饼图不需要）
+                y: Y轴列名（饼图不需要）
+                series: 系列分组列名（可选，用于多系列图表）
+                y_format: Y轴格式，支持 number, percent, currency
+
+            Returns:
+                包含 ECharts option 的图表配置
+            """
+            return tool_executor.execute("plot", {
+                "chart_type": chart_type,
+                "title": title,
+                "data": data,
+                "x": x,
+                "y": y,
+                "series": series,
+                "y_format": y_format
+            })
+
+        @tool
+        def resolve_fields(dataset_id: str, terms: List[str]) -> dict:
+            """将用户提到的字段名映射到数据集中的真实字段名
+
+            当用户提到的字段名与数据集字段不完全匹配时使用此工具。
+            例如用户说"退货原因"，但数据集中可能是"产品质量"、"物流异常"等具体字段。
+
+            Args:
+                dataset_id: 数据集ID
+                terms: 用户提到的字段名或术语列表，例如 ["退货原因", "质量问题"]
+
+            Returns:
+                mapped_columns: 匹配到的真实字段名列表
+                suggestions: 每个术语对应的建议字段
+            """
+            return tool_executor.execute("resolve_fields", {
+                "dataset_id": dataset_id,
+                "terms": terms
+            })
+
+        return [get_schema, sample_rows, run_query, plot, resolve_fields]
+
+    def run(self, user_query: str, dataset_id: Optional[str] = None, llm_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """运行 Tool Calling 循环"""
+        if llm_config:
+            self.llm = self._create_llm(llm_config)
+            self.tools = self._create_tools()
+            self.llm_with_tools = self.llm.bind_tools(self.tools)
+
+        trace = TraceContext()
+        log.info(f"开始分析: trace_id={trace.trace_id}")
+
+        messages = [
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=f"数据集ID: {dataset_id}\n\n用户问题: {user_query}" if dataset_id else user_query)
+        ]
+
+        for step in range(self.max_steps):
+            log.info(f"执行步骤 {step + 1}/{self.max_steps}")
+
+            # 调试：打印请求的消息
+            log.info(f"发送消息数量: {len(messages)}")
+            if messages:
+                last_msg = messages[-1]
+                log.info(f"最后一条消息类型: {type(last_msg).__name__}")
+
+            response = self.llm_with_tools.invoke(messages)
+
+            # 提取 token 使用量
+            if hasattr(response, 'response_metadata'):
+                metadata = response.response_metadata
+                # OpenAI 格式
+                if 'token_usage' in metadata:
+                    usage = metadata['token_usage']
+                    trace.llm_tokens += usage.get('total_tokens', 0)
+                    # 估算成本 (GPT-4 Turbo 价格: $10/1M input, $30/1M output)
+                    input_cost = usage.get('prompt_tokens', 0) * 0.00001
+                    output_cost = usage.get('completion_tokens', 0) * 0.00003
+                    trace.llm_cost_usd += input_cost + output_cost
+                # Anthropic 格式
+                elif 'usage' in metadata:
+                    usage = metadata['usage']
+                    trace.llm_tokens += usage.get('input_tokens', 0) + usage.get('output_tokens', 0)
+                    # Claude 价格: $3/1M input, $15/1M output
+                    input_cost = usage.get('input_tokens', 0) * 0.000003
+                    output_cost = usage.get('output_tokens', 0) * 0.000015
+                    trace.llm_cost_usd += input_cost + output_cost
+
+            # 调试：打印响应信息
+            log.info(f"LLM 响应类型: {type(response)}")
+            log.info(f"LLM 是否有 tool_calls: {hasattr(response, 'tool_calls')}")
+            if hasattr(response, 'tool_calls'):
+                log.info(f"tool_calls 内容: {response.tool_calls}")
+                log.info(f"tool_calls 数量: {len(response.tool_calls) if response.tool_calls else 0}")
+            log.info(f"响应内容前100字: {response.content[:100] if response.content else 'None'}")
+
+            # 打印响应的原始属性（用于深度调试）
+            if hasattr(response, 'additional_kwargs'):
+                log.info(f"additional_kwargs: {response.additional_kwargs}")
+            if hasattr(response, 'response_metadata'):
+                log.info(f"response_metadata: {response.response_metadata}")
+
+            if not response.tool_calls:
+                final_answer = response.content
+                log.info("LLM 给出最终答案")
+
+                # 从 trace 中提取图表和表格
+                charts = []
+                tables = []
+                table_index = 0
+                for step_log in trace.steps:
+                    if step_log.tool == "plot" and step_log.result:
+                        charts.append(step_log.result)
+                    elif step_log.tool == "run_query" and step_log.result:
+                        table_index += 1
+                        tables.append({
+                            "name": f"查询结果_{table_index}",
+                            "columns": step_log.result.get("columns", []),
+                            "rows": step_log.result.get("rows", [])
+                        })
+
+                return {
+                    "answer": final_answer,
+                    "charts": charts,
+                    "tables": tables,
+                    "trace": trace.to_dict(),
+                    "steps": step + 1
+                }
+
+            messages.append(response)
+
+            for tool_call in response.tool_calls:
+                tool_name = tool_call["name"]
+                tool_args = tool_call["args"]
+
+                step_log = StepLog(
+                    tool=tool_name,
+                    args=tool_args,
+                    timestamp=datetime.now()
+                )
+
+                try:
+                    import time
+                    start = time.time()
+                    result = self.tool_executor.execute(tool_name, tool_args)
+                    step_log.latency_ms = (time.time() - start) * 1000
+                    step_log.result = result
+
+                    messages.append(
+                        ToolMessage(
+                            content=json.dumps(result, ensure_ascii=False),
+                            tool_call_id=tool_call["id"]
+                        )
+                    )
+
+                    log.info(f"工具执行成功: {tool_name}")
+
+                except Exception as e:
+                    step_log.error = str(e)
+                    log.error(f"工具执行失败: {tool_name} - {e}")
+
+                    messages.append(
+                        ToolMessage(
+                            content=f"错误: {str(e)}",
+                            tool_call_id=tool_call["id"]
+                        )
+                    )
+
+                trace.add_step(step_log)
+
+        log.warning(f"达到最大步数限制: {self.max_steps}")
+        return {
+            "answer": "抱歉，分析步骤超过限制，请简化问题或联系管理员。",
+            "trace": trace.to_dict(),
+            "steps": self.max_steps,
+            "error": "达到最大步数限制"
+        }
+
+
+class StreamingLLMAgent(LLMAgent):
+    """支持流式输出的 LLM Agent"""
+
+    async def run_stream(self, user_query: str, dataset_id: Optional[str] = None):
+        """
+        运行流式 Tool Calling 循环
+
+        Yields:
+            事件字典，包含 type 和相关数据
+        """
+        import time
+
+        trace = TraceContext()
+        log.info(f"开始流式分析: trace_id={trace.trace_id}")
+
+        # 发送开始事件
+        yield {"type": "start", "trace_id": trace.trace_id}
+
+        messages = [
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=f"数据集ID: {dataset_id}\n\n用户问题: {user_query}" if dataset_id else user_query)
+        ]
+
+        charts = []
+        tables = []
+        table_index = 0
+
+        for step in range(self.max_steps):
+            log.info(f"执行步骤 {step + 1}/{self.max_steps}")
+
+            # 发送步骤开始事件
+            yield {"type": "step_start", "step": step + 1, "max_steps": self.max_steps}
+
+            response = self.llm_with_tools.invoke(messages)
+
+            # 提取 token 使用量
+            if hasattr(response, 'response_metadata'):
+                metadata = response.response_metadata
+                if 'token_usage' in metadata:
+                    usage = metadata['token_usage']
+                    trace.llm_tokens += usage.get('total_tokens', 0)
+                    input_cost = usage.get('prompt_tokens', 0) * 0.00001
+                    output_cost = usage.get('completion_tokens', 0) * 0.00003
+                    trace.llm_cost_usd += input_cost + output_cost
+                elif 'usage' in metadata:
+                    usage = metadata['usage']
+                    trace.llm_tokens += usage.get('input_tokens', 0) + usage.get('output_tokens', 0)
+                    input_cost = usage.get('input_tokens', 0) * 0.000003
+                    output_cost = usage.get('output_tokens', 0) * 0.000015
+                    trace.llm_cost_usd += input_cost + output_cost
+
+            if not response.tool_calls:
+                # 最终答案
+                final_answer = response.content
+
+                # 发送答案事件（分块发送以模拟流式效果）
+                chunk_size = 50
+                for i in range(0, len(final_answer), chunk_size):
+                    chunk = final_answer[i:i + chunk_size]
+                    yield {"type": "answer_chunk", "content": chunk}
+
+                # 发送完成事件
+                yield {
+                    "type": "complete",
+                    "answer": final_answer,
+                    "charts": charts,
+                    "tables": tables,
+                    "trace": trace.to_dict(),
+                    "steps": step + 1
+                }
+                return
+
+            messages.append(response)
+
+            for tool_call in response.tool_calls:
+                tool_name = tool_call["name"]
+                tool_args = tool_call["args"]
+
+                # 发送工具调用事件
+                yield {"type": "tool_call", "tool": tool_name, "args": tool_args}
+
+                step_log = StepLog(
+                    tool=tool_name,
+                    args=tool_args,
+                    timestamp=datetime.now()
+                )
+
+                try:
+                    start = time.time()
+                    result = self.tool_executor.execute(tool_name, tool_args)
+                    step_log.latency_ms = (time.time() - start) * 1000
+                    step_log.result = result
+
+                    # 收集图表和表格
+                    if tool_name == "plot" and result:
+                        charts.append(result)
+                    elif tool_name == "run_query" and result:
+                        table_index += 1
+                        tables.append({
+                            "name": f"查询结果_{table_index}",
+                            "columns": result.get("columns", []),
+                            "rows": result.get("rows", [])
+                        })
+
+                    messages.append(
+                        ToolMessage(
+                            content=json.dumps(result, ensure_ascii=False),
+                            tool_call_id=tool_call["id"]
+                        )
+                    )
+
+                    # 发送工具结果事件
+                    yield {
+                        "type": "tool_result",
+                        "tool": tool_name,
+                        "success": True,
+                        "latency_ms": step_log.latency_ms
+                    }
+
+                except Exception as e:
+                    step_log.error = str(e)
+                    log.error(f"工具执行失败: {tool_name} - {e}")
+
+                    messages.append(
+                        ToolMessage(
+                            content=f"错误: {str(e)}",
+                            tool_call_id=tool_call["id"]
+                        )
+                    )
+
+                    yield {
+                        "type": "tool_result",
+                        "tool": tool_name,
+                        "success": False,
+                        "error": str(e)
+                    }
+
+                trace.add_step(step_log)
+
+        # 达到最大步数
+        yield {
+            "type": "complete",
+            "answer": "抱歉，分析步骤超过限制，请简化问题或联系管理员。",
+            "charts": charts,
+            "tables": tables,
+            "trace": trace.to_dict(),
+            "steps": self.max_steps,
+            "error": "达到最大步数限制"
+        }
+
+
+def get_llm_agent(llm_config: Optional[Dict[str, Any]] = None) -> LLMAgent:
+    """获取 LLMAgent 实例"""
+    return LLMAgent(llm_config)
+
+
+def get_streaming_llm_agent(llm_config: Optional[Dict[str, Any]] = None) -> StreamingLLMAgent:
+    """获取流式 LLMAgent 实例"""
+    return StreamingLLMAgent(llm_config)
