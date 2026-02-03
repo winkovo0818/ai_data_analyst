@@ -30,9 +30,27 @@ TOOL_DESCRIPTION = """
   - as: 结果列名
   - agg: 聚合函数（sum, avg, min, max, count, nunique）
   - col: 聚合列名
+- time_bucket: 时间分桶（可选）
+  - col: 时间列名
+  - granularity: 分桶粒度（hour, day, week, month, quarter, year）
+  - as: 结果列名
+- having: 聚合后过滤条件数组（可选）
+  - col: 列名（聚合别名/分组列）
+  - op: 操作符（=, !=, >, >=, <, <=, in, between, contains, is_null）
+  - value: 过滤值
+- top_k: Top K 规则（可选）
+  - by: 排序列名
+  - k: Top K 数量
+  - order: 排序方向（asc, desc）
 - derived: 衍生字段数组（可选）
   - as: 结果列名
   - expr: 计算表达式（支持 +, -, *, /, nullif, coalesce, round, abs）
+- ratios: 比例/百分比指标（可选）
+  - as: 结果列名
+  - numerator: 分子列名或别名
+  - denominator: 分母列名或别名
+  - kind: ratio 或 percent
+  - round: 小数位数（可选）
 - sort: 排序规则数组（可选）
   - col: 排序列名
   - dir: 排序方向（asc, desc）

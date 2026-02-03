@@ -128,7 +128,29 @@ class ToolExecutor:
     def _execute_plot(self, args: Any) -> Dict[str, Any]:
         """执行 plot"""
         # args 已经过 PlotInput 规范化
-        spec = PlotSpec(**args.model_dump(exclude_none=True, exclude={"rows", "columns"}))
+        payload = args.model_dump(exclude_none=True, exclude={"rows", "columns"})
+        chart_type = payload.get("chart_type")
+        x = payload.get("x")
+        y = payload.get("y")
+        series = payload.get("series")
+
+        if chart_type in (None, "auto") or not x or not y:
+            recommendation = self.plot_engine.recommend(
+                payload.get("data", []),
+                x=x,
+                y=y,
+                series=series
+            )
+            if chart_type in (None, "auto"):
+                payload["chart_type"] = recommendation["chart_type"]
+            if not x:
+                payload["x"] = recommendation.get("x")
+            if not y:
+                payload["y"] = recommendation.get("y")
+            if series is None:
+                payload["series"] = recommendation.get("series")
+
+        spec = PlotSpec(**payload)
         chart = self.plot_engine.generate(spec)
         return chart.model_dump()
 

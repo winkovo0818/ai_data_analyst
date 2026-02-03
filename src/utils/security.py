@@ -1,8 +1,9 @@
 """安全防护工具"""
 
 import re
-from typing import Any, Dict
+from typing import Any, Dict, Callable, List, Tuple, Set, Optional
 from src.utils.logger import log
+from src.core.constants import ALLOWED_EXPR_FUNCTIONS
 
 
 class SecurityValidator:
@@ -121,4 +122,139 @@ class SecurityValidator:
             log.warning("聚合操作过多")
             return False
 
+        # 检查 having 条件数量
+        if len(query_spec.get("having", [])) > 20:
+            log.warning("having 条件过多")
+            return False
+
+        # 检查比例指标数量
+        if len(query_spec.get("ratios", [])) > 20:
+            log.warning("比例指标过多")
+            return False
+
         return True
+
+    @classmethod
+    def parse_expression(
+        cls,
+        expr: str,
+        allowed_identifiers: Set[str],
+        quote_identifier: Callable[[str], str]
+    ) -> str:
+        """
+        安全解析表达式并输出 SQL 片段
+
+        Args:
+            expr: 原始表达式
+            allowed_identifiers: 允许的字段/别名集合
+            quote_identifier: 标识符引用函数
+
+        Returns:
+            规范化后的安全表达式
+        """
+        if not cls.validate_expression(expr):
+            raise ValueError("表达式包含非法内容")
+
+        token_spec = re.compile(
+            r"\s*(?:(\d+(?:\.\d+)?)|([A-Za-z_\u4e00-\u9fa5][\w\u4e00-\u9fa5]*)|([+\-*/(),]))"
+        )
+
+        tokens: List[Tuple[str, str]] = []
+        pos = 0
+        while pos < len(expr):
+            match = token_spec.match(expr, pos)
+            if not match:
+                raise ValueError("表达式包含非法字符")
+            number, ident, op = match.groups()
+            if number:
+                tokens.append(("number", number))
+            elif ident:
+                tokens.append(("ident", ident))
+            elif op:
+                tokens.append(("op", op))
+            pos = match.end()
+
+        index = 0
+
+        def peek() -> Optional[Tuple[str, str]]:
+            return tokens[index] if index < len(tokens) else None
+
+        def consume(expected: str | None = None) -> Tuple[str, str]:
+            nonlocal index
+            if index >= len(tokens):
+                raise ValueError("表达式不完整")
+            token = tokens[index]
+            if expected and token[1] != expected:
+                raise ValueError("表达式语法错误")
+            index += 1
+            return token
+
+        def parse_expression() -> str:
+            node = parse_term()
+            while True:
+                token = peek()
+                if token and token[0] == "op" and token[1] in {"+", "-"}:
+                    op = consume()[1]
+                    right = parse_term()
+                    node = f"({node} {op} {right})"
+                else:
+                    break
+            return node
+
+        def parse_term() -> str:
+            node = parse_factor()
+            while True:
+                token = peek()
+                if token and token[0] == "op" and token[1] in {"*", "/"}:
+                    op = consume()[1]
+                    right = parse_factor()
+                    node = f"({node} {op} {right})"
+                else:
+                    break
+            return node
+
+        def parse_factor() -> str:
+            token = peek()
+            if not token:
+                raise ValueError("表达式不完整")
+
+            if token[0] == "op" and token[1] in {"+", "-"}:
+                op = consume()[1]
+                value = parse_factor()
+                return f"{op}{value}"
+
+            if token[0] == "number":
+                return consume()[1]
+
+            if token[0] == "ident":
+                ident = consume()[1]
+                next_token = peek()
+                if next_token and next_token[0] == "op" and next_token[1] == "(":
+                    if ident.lower() not in ALLOWED_EXPR_FUNCTIONS:
+                        raise ValueError(f"表达式包含未授权函数: {ident}")
+                    consume("(")
+                    args: List[str] = []
+                    if peek() and not (peek()[0] == "op" and peek()[1] == ")"):
+                        args.append(parse_expression())
+                        while peek() and peek()[0] == "op" and peek()[1] == ",":
+                            consume(",")
+                            args.append(parse_expression())
+                    consume(")")
+                    return f"{ident}({', '.join(args)})"
+
+                if ident not in allowed_identifiers:
+                    raise ValueError(f"表达式包含未授权字段: {ident}")
+                return quote_identifier(ident)
+
+            if token[0] == "op" and token[1] == "(":
+                consume("(")
+                inner = parse_expression()
+                consume(")")
+                return f"({inner})"
+
+            raise ValueError("表达式语法错误")
+
+        result = parse_expression()
+        if index != len(tokens):
+            raise ValueError("表达式语法错误")
+        return result

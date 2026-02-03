@@ -5,7 +5,8 @@ from pydantic import BaseModel, Field, field_validator
 from src.core.constants import (
     ALLOWED_FILTER_OPERATORS,
     ALLOWED_AGGREGATIONS,
-    ALLOWED_EXPR_FUNCTIONS
+    ALLOWED_EXPR_FUNCTIONS,
+    TIME_BUCKET_GRAINULARITIES
 )
 
 
@@ -60,6 +61,36 @@ class DerivedField(BaseModel):
         return v
 
 
+class TimeBucket(BaseModel):
+    """时间分桶"""
+    col: str = Field(..., description="时间列名")
+    granularity: str = Field(..., description="分桶粒度: hour, day, week, month, quarter, year")
+    as_: str = Field("time_bucket", alias="as", description="结果列名")
+
+    @field_validator("granularity")
+    @classmethod
+    def validate_granularity(cls, v: str) -> str:
+        if v not in TIME_BUCKET_GRAINULARITIES:
+            raise ValueError(f"不支持的分桶粒度: {v}. 允许的粒度: {TIME_BUCKET_GRAINULARITIES}")
+        return v
+
+
+class TopKSpec(BaseModel):
+    """Top K 规则"""
+    by: str = Field(..., description="排序列名")
+    k: int = Field(..., ge=1, le=10000, description="Top K 数量")
+    order: Literal["asc", "desc"] = Field("desc", description="排序方向")
+
+
+class RatioMetric(BaseModel):
+    """比例/百分比指标"""
+    as_: str = Field(..., alias="as", description="结果列名")
+    numerator: str = Field(..., description="分子列名或别名")
+    denominator: str = Field(..., description="分母列名或别名")
+    kind: Literal["ratio", "percent"] = Field("ratio", description="指标类型")
+    round: Optional[int] = Field(None, ge=0, le=6, description="小数位数（可选）")
+
+
 class SortSpec(BaseModel):
     """排序规则"""
     col: str = Field(..., description="排序列名")
@@ -73,6 +104,10 @@ class QuerySpec(BaseModel):
     group_by: List[str] = Field(default_factory=list, description="分组列")
     aggregations: List[Aggregation] = Field(default_factory=list, description="聚合操作")
     derived: List[DerivedField] = Field(default_factory=list, description="衍生字段")
+    ratios: List[RatioMetric] = Field(default_factory=list, description="比例/百分比指标")
+    time_bucket: Optional[TimeBucket] = Field(None, description="时间分桶")
+    having: List[FilterCondition] = Field(default_factory=list, description="聚合后过滤条件")
+    top_k: Optional[TopKSpec] = Field(None, description="Top K 规则")
     sort: List[SortSpec] = Field(default_factory=list, description="排序规则")
     limit: int = Field(5000, ge=1, le=10000, description="返回行数限制")
 

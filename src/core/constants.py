@@ -22,6 +22,11 @@ ALLOWED_EXPR_FUNCTIONS: Set[str] = {
     "+", "-", "*", "/"
 }
 
+# 时间分桶粒度
+TIME_BUCKET_GRAINULARITIES: Set[str] = {
+    "hour", "day", "week", "month", "quarter", "year"
+}
+
 # 图表类型
 CHART_TYPES: Set[str] = {
     "line", "bar", "pie", "scatter", "area"

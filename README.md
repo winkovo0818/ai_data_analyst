@@ -112,6 +112,61 @@ npm run dev
 | `plot` | 生成图表 | 支持折线图/柱状图/饼图（ECharts/PNG） |
 | `resolve_fields` | 语义字段映射 | 将用户自然语言映射到实际字段名 |
 
+## 使用示例（Query DSL + 自动图表推荐）
+
+### 示例1：比例指标 + 时间分桶 + having
+
+```json
+{
+  "dataset_id": "ds_xxx",
+  "time_bucket": {
+    "col": "订单时间",
+    "granularity": "month",
+    "as": "月份"
+  },
+  "group_by": ["渠道"],
+  "aggregations": [
+    {"as": "订单数", "agg": "count", "col": "*"},
+    {"as": "退货数", "agg": "sum", "col": "退货数量"}
+  ],
+  "ratios": [
+    {"as": "退货率", "numerator": "退货数", "denominator": "订单数", "kind": "percent", "round": 2}
+  ],
+  "having": [
+    {"col": "订单数", "op": ">=", "value": 100}
+  ],
+  "sort": [
+    {"col": "月份", "dir": "asc"}
+  ],
+  "limit": 1000
+}
+```
+
+说明：
+- `time_bucket` 会将时间列按月份分桶
+- `ratios` 自动生成百分比指标（使用安全表达式解析）
+- `having` 在聚合后过滤结果
+
+### 示例2：自动图表推荐（chart_type=auto）
+
+```json
+{
+  "chart_type": "auto",
+  "title": "各渠道退货率趋势",
+  "columns": ["月份", "渠道", "退货率"],
+  "rows": [
+    ["2024-01-01", "线上", 1.2],
+    ["2024-01-01", "线下", 0.9],
+    ["2024-02-01", "线上", 1.5],
+    ["2024-02-01", "线下", 1.0]
+  ]
+}
+```
+
+说明：
+- `chart_type=auto` 时系统会自动选择图表类型并映射 `x/y/series`
+- 传入 `rows + columns` 或 `data` 均可
+
 ## 核心引擎
 
 | 引擎 | 功能 |

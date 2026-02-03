@@ -238,7 +238,7 @@ for step in range(MAX_STEPS):
 ##  7. 返回结果结构（统一）
 ```json
 {
-  "answer": "2025 年 Amazon_XD_US 账号中，产品质量类退货在 1-3 月呈上升趋势...",
+  "answer": "2025 年 Amazon_XX_XX 账号中，产品质量类退货在 1-3 月呈上升趋势...",
   "tables": [
     {
       "name": "aggregated_data",

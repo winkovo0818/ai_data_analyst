@@ -1,6 +1,7 @@
 """Plot Engine - 图表生成引擎"""
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+from datetime import datetime, date
 from src.models.plot import PlotSpec, ChartOutput
 from src.utils.logger import log
 
@@ -47,6 +48,109 @@ class PlotEngine:
     def _validate_xy(self, spec: PlotSpec) -> None:
         if not spec.x or not spec.y:
             raise ValueError("图表必须提供 x 和 y 字段")
+
+    def _is_numeric(self, value: Any) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    def _is_datetime(self, value: Any) -> bool:
+        if isinstance(value, (datetime, date)):
+            return True
+        if isinstance(value, str):
+            try:
+                datetime.fromisoformat(value.replace("Z", "+00:00"))
+                return True
+            except ValueError:
+                return False
+        return False
+
+    def _infer_column_type(self, data: List[Dict[str, Any]], col: str) -> str:
+        for row in data:
+            if col not in row:
+                continue
+            value = row.get(col)
+            if value is None:
+                continue
+            if self._is_numeric(value):
+                return "number"
+            if self._is_datetime(value):
+                return "datetime"
+            return "category"
+        return "category"
+
+    def _unique_count(self, data: List[Dict[str, Any]], col: str, limit: int = 50) -> int:
+        values = []
+        for row in data:
+            if col in row and row[col] is not None:
+                values.append(row[col])
+                if len(values) >= limit:
+                    break
+        return len(set(values))
+
+    def recommend(
+        self,
+        data: List[Dict[str, Any]],
+        x: Optional[str] = None,
+        y: Optional[str] = None,
+        series: Optional[str] = None
+    ) -> Dict[str, Optional[str]]:
+        """
+        根据数据推荐图表类型与字段映射
+        """
+        if not data:
+            raise ValueError("图表数据为空，无法推荐图表")
+
+        columns = list(data[0].keys())
+        column_types = {col: self._infer_column_type(data, col) for col in columns}
+
+        numeric_cols = [c for c, t in column_types.items() if t == "number"]
+        datetime_cols = [c for c, t in column_types.items() if t == "datetime"]
+        category_cols = [c for c, t in column_types.items() if t == "category"]
+
+        if y is None:
+            if not numeric_cols:
+                raise ValueError("无法识别数值列用于 Y 轴")
+            y = numeric_cols[0]
+
+        if x is None:
+            candidate_datetime = [c for c in datetime_cols if c != y]
+            candidate_category = [c for c in category_cols if c != y]
+            if candidate_datetime:
+                x = candidate_datetime[0]
+            elif candidate_category:
+                x = candidate_category[0]
+            elif len(numeric_cols) > 1:
+                x = [c for c in numeric_cols if c != y][0]
+            else:
+                raise ValueError("无法识别 X 轴字段")
+
+        if series is None:
+            candidates = [c for c in category_cols if c not in {x, y}]
+            for c in candidates:
+                if self._unique_count(data, c) <= 10:
+                    series = c
+                    break
+
+        chart_type = "bar"
+        if x in numeric_cols and y in numeric_cols and x != y:
+            chart_type = "scatter"
+            series = None
+        elif x in datetime_cols:
+            chart_type = "line"
+        elif series:
+            chart_type = "bar"
+        else:
+            if x in category_cols and self._unique_count(data, x) <= 8:
+                chart_type = "pie"
+
+        if chart_type == "pie":
+            series = None
+
+        return {
+            "chart_type": chart_type,
+            "x": x,
+            "y": y,
+            "series": series
+        }
 
     def _build_series(self, spec: PlotSpec) -> Dict[str, Any]:
         """按 x 轴对齐构建 series 数据"""

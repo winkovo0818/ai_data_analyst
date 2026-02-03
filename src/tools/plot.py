@@ -7,7 +7,7 @@ from src.models.plot import PlotSpec, ChartOutput
 
 class PlotInput(BaseModel):
     """生成图表输入"""
-    chart_type: str = Field(..., description="图表类型: line, bar, pie, scatter, area")
+    chart_type: Optional[str] = Field("auto", description="图表类型: line, bar, pie, scatter, area, auto")
     title: str = Field(..., description="图表标题")
     x: Optional[str] = Field(None, description="X轴列名")
     y: Optional[str] = Field(None, description="Y轴列名")
@@ -28,6 +28,8 @@ class PlotInput(BaseModel):
                 if not self.columns:
                     raise ValueError("当 data/rows 为二维数组时必须提供 columns")
                 data = [dict(zip(self.columns, row)) for row in data]
+        if not self.chart_type:
+            self.chart_type = "auto"
         self.data = data
         return self
 
@@ -43,7 +45,7 @@ TOOL_DESCRIPTION = """
 生成数据可视化图表。
 
 参数：
-- chart_type: 图表类型（line, bar, pie, scatter, area）
+- chart_type: 图表类型（line, bar, pie, scatter, area, auto）
 - title: 图表标题
 - x: X轴列名（饼图不需要）
 - y: Y轴列名（饼图不需要）
@@ -70,4 +72,5 @@ TOOL_DESCRIPTION = """
 1. 趋势分析：使用折线图展示时间序列
 2. 对比分析：使用柱状图对比不同维度
 3. 占比分析：使用饼图展示结构占比
+4. 自动推荐：chart_type=auto 时根据数据自动选择图表并映射 x/y/series
 """

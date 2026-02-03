@@ -3,13 +3,11 @@
 import time
 import hashlib
 import json
-import re
 import duckdb
 from typing import List, Any, Dict, Optional, Tuple, Set
-from src.models.query import QuerySpec, QueryResult, FilterCondition
+from src.models.query import QuerySpec, QueryResult, FilterCondition, DerivedField, RatioMetric
 from src.engines.dataset_manager import get_dataset_manager
 from src.core.config import settings
-from src.core.constants import ALLOWED_EXPR_FUNCTIONS
 from src.utils.logger import log
 from src.utils.security import SecurityValidator
 
@@ -106,11 +104,6 @@ class QueryEngine:
         # 执行查询
         conn = self.dataset_manager._get_connection()
         try:
-            try:
-                conn.execute(f"SET statement_timeout='{self.timeout}s'")
-            except Exception as e:
-                log.warning(f"设置查询超时失败: {e}")
-
             result_df = conn.execute(sql, params).fetchdf()
 
             execution_time = (time.time() - start_time) * 1000
@@ -141,15 +134,58 @@ class QueryEngine:
         """转义 LIKE 模式字符"""
         return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
+    def _build_time_bucket(self, col: str, granularity: str) -> str:
+        """构建时间分桶表达式"""
+        return f"DATE_TRUNC('{granularity}', {self._quote_identifier(col)})"
+
+    def _build_ratio_fields(self, ratios: List[RatioMetric]) -> List[DerivedField]:
+        """构建比例/百分比衍生字段"""
+        derived_fields: List[DerivedField] = []
+        for ratio in ratios:
+            expr = f"{ratio.numerator} / nullif({ratio.denominator}, 0)"
+            if ratio.kind == "percent":
+                expr = f"({expr}) * 100"
+            if ratio.round is not None:
+                expr = f"round({expr}, {ratio.round})"
+            derived_fields.append(DerivedField(as_=ratio.as_, expr=expr))
+        return derived_fields
+
     def _validate_spec(self, spec: QuerySpec, metadata) -> None:
         """校验查询字段与聚合合法性"""
         available_cols = {c.name for c in metadata.columns_schema}
         agg_aliases = {agg.as_ for agg in spec.aggregations}
         derived_aliases = {d.as_ for d in spec.derived}
-        if spec.group_by or spec.aggregations:
-            allowed_sort = set(spec.group_by) | agg_aliases | derived_aliases
+        ratio_aliases = {r.as_ for r in spec.ratios}
+        group_cols = list(spec.group_by)
+        time_bucket_alias = None
+
+        if spec.time_bucket:
+            if spec.time_bucket.col not in available_cols:
+                raise ValueError(f"时间分桶列不存在: {spec.time_bucket.col}")
+            time_bucket_alias = spec.time_bucket.as_
+            group_cols.append(time_bucket_alias)
+
+        if spec.time_bucket and not (spec.group_by or spec.aggregations):
+            raise ValueError("时间分桶需要与分组或聚合一起使用")
+
+        if spec.having and not (spec.group_by or spec.aggregations or spec.time_bucket):
+            raise ValueError("having 需要与分组或聚合一起使用")
+
+        allowed_ratio_fields = available_cols | agg_aliases
+        if time_bucket_alias:
+            allowed_ratio_fields.add(time_bucket_alias)
+
+        for ratio in spec.ratios:
+            if ratio.numerator not in allowed_ratio_fields:
+                raise ValueError(f"比例指标分子不存在: {ratio.numerator}")
+            if ratio.denominator not in allowed_ratio_fields:
+                raise ValueError(f"比例指标分母不存在: {ratio.denominator}")
+
+        allowed_output_cols = set(group_cols) | agg_aliases | derived_aliases | ratio_aliases
+        if spec.group_by or spec.aggregations or spec.time_bucket:
+            allowed_sort = allowed_output_cols
         else:
-            allowed_sort = available_cols | derived_aliases
+            allowed_sort = available_cols | derived_aliases | ratio_aliases
 
         for col in spec.group_by:
             if col not in available_cols:
@@ -165,49 +201,48 @@ class QueryEngine:
             if f.col not in available_cols:
                 raise ValueError(f"过滤列不存在: {f.col}")
 
+        for h in spec.having:
+            if h.col not in allowed_output_cols:
+                raise ValueError(f"having 列不存在: {h.col}")
+
+        if spec.top_k:
+            if spec.top_k.by not in allowed_sort:
+                raise ValueError(f"Top K 排序列不存在: {spec.top_k.by}")
+
         for s in spec.sort:
             if s.col not in allowed_sort:
                 raise ValueError(f"排序列不存在: {s.col}")
 
-    def _normalize_expression(self, expr: str, allowed_identifiers: Set[str]) -> str:
-        """验证并规范化表达式（仅允许白名单函数与字段）"""
-        if not SecurityValidator.validate_expression(expr):
-            raise ValueError("表达式包含非法内容")
-
-        if not re.fullmatch(r"[0-9A-Za-z_\u4e00-\u9fa5\s\+\-\*\/\(\),\.]+", expr):
-            raise ValueError("表达式包含非法字符")
-
-        identifiers = re.findall(r"[A-Za-z_\u4e00-\u9fa5][\w\u4e00-\u9fa5]*", expr)
-        for ident in identifiers:
-            if ident.lower() in ALLOWED_EXPR_FUNCTIONS:
-                continue
-            if ident not in allowed_identifiers:
-                raise ValueError(f"表达式包含未授权字段: {ident}")
-
-        def replace_ident(match: re.Match) -> str:
-            ident = match.group(0)
-            if ident.lower() in ALLOWED_EXPR_FUNCTIONS:
-                return ident
-            if ident in allowed_identifiers:
-                return self._quote_identifier(ident)
-            return ident
-
-        return re.sub(r"[A-Za-z_\u4e00-\u9fa5][\w\u4e00-\u9fa5]*", replace_ident, expr)
+    def _parse_expression(self, expr: str, allowed_identifiers: Set[str]) -> str:
+        """安全解析表达式（仅允许白名单函数与字段）"""
+        return SecurityValidator.parse_expression(expr, allowed_identifiers, self._quote_identifier)
 
     def _build_sql(self, spec: QuerySpec, metadata) -> Tuple[str, List[Any]]:
         """构建 SQL 语句"""
         table_name = self.dataset_manager.get_table_name(spec.dataset_id)
 
-        # SELECT 子句
-        select_parts = []
-        output_columns = []
+        derived_fields = list(spec.derived)
+        if spec.ratios:
+            derived_fields.extend(self._build_ratio_fields(spec.ratios))
+
+        # SELECT 子句与 GROUP BY
+        select_parts: List[str] = []
+        output_columns: List[str] = []
+        group_by_exprs: List[str] = []
+
+        if spec.time_bucket:
+            bucket_expr = self._build_time_bucket(spec.time_bucket.col, spec.time_bucket.granularity)
+            select_parts.append(f'{bucket_expr} AS {self._quote_identifier(spec.time_bucket.as_)}')
+            output_columns.append(spec.time_bucket.as_)
+            group_by_exprs.append(bucket_expr)
 
         if spec.group_by:
-            # 分组查询
             for col in spec.group_by:
                 select_parts.append(f'{self._quote_identifier(col)} AS {self._quote_identifier(col)}')
                 output_columns.append(col)
+                group_by_exprs.append(self._quote_identifier(col))
 
+        if spec.aggregations:
             for agg in spec.aggregations:
                 if agg.agg == "nunique":
                     agg_expr = f'COUNT(DISTINCT {self._quote_identifier(agg.col)})'
@@ -217,25 +252,16 @@ class QueryEngine:
                     agg_expr = f'{agg.agg.upper()}({self._quote_identifier(agg.col)})'
                 select_parts.append(f'{agg_expr} AS {self._quote_identifier(agg.as_)}')
                 output_columns.append(agg.as_)
-        else:
-            # 非分组查询
-            if spec.aggregations:
-                for agg in spec.aggregations:
-                    if agg.agg == "nunique":
-                        agg_expr = f'COUNT(DISTINCT {self._quote_identifier(agg.col)})'
-                    elif agg.agg == "count" and agg.col == "*":
-                        agg_expr = "COUNT(*)"
-                    else:
-                        agg_expr = f'{agg.agg.upper()}({self._quote_identifier(agg.col)})'
-                    select_parts.append(f'{agg_expr} AS {self._quote_identifier(agg.as_)}')
-                    output_columns.append(agg.as_)
-            else:
-                select_parts.append("*")
 
-        # 如果存在衍生字段且当前使用 *, 展开为显式列
-        if spec.derived and select_parts == ["*"]:
-            select_parts = [self._quote_identifier(c.name) for c in metadata.columns_schema]
-            output_columns = [c.name for c in metadata.columns_schema]
+        has_grouping = bool(group_by_exprs) or bool(spec.aggregations)
+
+        if not has_grouping:
+            select_parts = ["*"]
+            output_columns = []
+
+            if derived_fields or spec.having or spec.top_k or spec.sort:
+                select_parts = [self._quote_identifier(c.name) for c in metadata.columns_schema]
+                output_columns = [c.name for c in metadata.columns_schema]
 
         select_clause = ", ".join(select_parts)
 
@@ -255,54 +281,59 @@ class QueryEngine:
 
         # GROUP BY 子句
         group_clause = ""
-        if spec.group_by:
-            group_cols = ", ".join([self._quote_identifier(col) for col in spec.group_by])
-            group_clause = f"GROUP BY {group_cols}"
+        if has_grouping:
+            group_clause = f"GROUP BY {', '.join(group_by_exprs)}"
 
-        # ORDER BY 子句
-        order_clause = ""
-        if spec.sort:
-            order_parts = [f'{self._quote_identifier(s.col)} {s.dir.upper()}' for s in spec.sort]
-            order_clause = f"ORDER BY {', '.join(order_parts)}"
-
-        # LIMIT 子句
-        limit_clause = f"LIMIT {min(spec.limit, settings.max_query_rows)}"
-
-        # 组合 SQL
-        sql_parts = [
+        base_sql_parts = [
             f"SELECT {select_clause}",
             from_clause,
             where_clause,
-            group_clause,
-            order_clause,
-            limit_clause
+            group_clause
         ]
+        base_sql = " ".join(p for p in base_sql_parts if p)
 
-        # 处理衍生字段（需要嵌套查询）
-        if spec.derived:
-            base_sql_parts = [
-                f"SELECT {select_clause}",
-                from_clause,
-                where_clause,
-                group_clause
-            ]
-            base_sql = " ".join(p for p in base_sql_parts if p)
-            allowed_identifiers = {c.name for c in metadata.columns_schema}
-            allowed_identifiers.update({agg.as_ for agg in spec.aggregations})
+        order_specs = []
+        limit_value = spec.limit
+        if spec.top_k:
+            order_specs = [(spec.top_k.by, spec.top_k.order)]
+            limit_value = spec.top_k.k
+        elif spec.sort:
+            order_specs = [(s.col, s.dir) for s in spec.sort]
 
+        limit_clause = f"LIMIT {min(limit_value, settings.max_query_rows)}"
+        order_clause = ""
+        if order_specs:
+            order_parts = [f'{self._quote_identifier(col)} {direction.upper()}' for col, direction in order_specs]
+            order_clause = f"ORDER BY {', '.join(order_parts)}"
+
+        if derived_fields or spec.having:
+            allowed_identifiers = set(output_columns)
             derived_parts = [self._quote_identifier(col) for col in output_columns]
-            for derived in spec.derived:
-                expr = self._normalize_expression(derived.expr, allowed_identifiers)
+            for derived in derived_fields:
+                expr = self._parse_expression(derived.expr, allowed_identifiers)
                 derived_parts.append(f'{expr} AS {self._quote_identifier(derived.as_)}')
+                allowed_identifiers.add(derived.as_)
+
+            outer_where = ""
+            if spec.having:
+                having_conditions = []
+                for h in spec.having:
+                    clause, clause_params = self._build_filter(h)
+                    having_conditions.append(clause)
+                    params.extend(clause_params)
+                outer_where = f"WHERE {' AND '.join(having_conditions)}"
 
             final_sql = f"SELECT {', '.join(derived_parts)} FROM ({base_sql}) AS subquery"
+            if outer_where:
+                final_sql = f"{final_sql} {outer_where}"
             if order_clause:
                 final_sql = f"{final_sql} {order_clause}"
             final_sql = f"{final_sql} {limit_clause}"
             return final_sql, params
 
-        base_sql = " ".join(p for p in sql_parts if p)
-        return base_sql, params
+        base_sql_parts = [base_sql, order_clause, limit_clause]
+        final_sql = " ".join(p for p in base_sql_parts if p)
+        return final_sql, params
 
     def _build_filter(self, filter: FilterCondition) -> Tuple[str, List[Any]]:
         """构建过滤条件"""
