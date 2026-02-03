@@ -120,7 +120,7 @@ class QueryEngine:
 
             return result
         except Exception as e:
-            log.error(f"查询执行失败: {e}")
+            log.error(f"查询执行失败: {e} | SQL: {sql} | params: {params}")
             raise
         finally:
             conn.close()
@@ -357,6 +357,10 @@ class QueryEngine:
                 raise ValueError("contains 操作符需要字符串值")
             escaped = self._escape_like(value)
             return f"{col} LIKE ? ESCAPE '\\\\'", [f"%{escaped}%"]
+        if op == "like":
+            if not isinstance(value, str):
+                raise ValueError("like 操作符需要字符串值")
+            return f"{col} LIKE ?", [value]
         if op == "is_null":
             return f"{col} IS NULL", []
         raise ValueError(f"不支持的操作符: {op}")
