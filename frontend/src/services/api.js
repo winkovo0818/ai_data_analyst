@@ -103,11 +103,14 @@ export const dataService = {
           const reader = response.body.getReader();
           const decoder = new TextDecoder();
           let buffer = '';
+          let finished = false;
 
           function read() {
             reader.read().then(({ done, value }) => {
               if (done) {
-                resolve();
+                if (!finished) {
+                  resolve();
+                }
                 return;
               }
 
@@ -123,7 +126,16 @@ export const dataService = {
 
                     // 如果是完成事件，resolve
                     if (data.type === 'complete') {
+                      finished = true;
                       resolve(data);
+                      return;
+                    }
+
+                    if (data.type === 'error') {
+                      finished = true;
+                      reader.cancel();
+                      reject(new Error(data.message || data.error || '请求失败'));
+                      return;
                     }
                   } catch (e) {
                     console.error('解析 SSE 数据失败:', e);
@@ -131,7 +143,9 @@ export const dataService = {
                 }
               }
 
-              read();
+              if (!finished) {
+                read();
+              }
             }).catch(reject);
           }
 

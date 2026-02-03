@@ -49,6 +49,9 @@ class DerivedField(BaseModel):
         import re
         # 移除空格和常见符号
         cleaned = re.sub(r'[\s\(\),]', '', v)
+        # 仅允许基础字符与运算符（防止引号与分号）
+        if not re.fullmatch(r"[0-9A-Za-z_\u4e00-\u9fa5\s\+\-\*\/\(\),\.]+", v):
+            raise ValueError("表达式包含非法字符")
         # 检查是否包含非法函数或关键字
         dangerous = ['exec', 'eval', 'import', 'open', 'file', '__']
         for d in dangerous:

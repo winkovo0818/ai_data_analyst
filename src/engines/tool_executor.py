@@ -127,26 +127,44 @@ class ToolExecutor:
 
     def _execute_plot(self, args: Any) -> Dict[str, Any]:
         """执行 plot"""
-        # args 已经是 PlotSpec 实例
-        chart = self.plot_engine.generate(args)
+        # args 已经过 PlotInput 规范化
+        spec = PlotSpec(**args.model_dump(exclude_none=True, exclude={"rows", "columns"}))
+        chart = self.plot_engine.generate(spec)
         return chart.model_dump()
 
     def _execute_resolve_fields(self, args: Any) -> Dict[str, Any]:
         """执行 resolve_fields"""
-        # 简单实现：基于关键词匹配列名
+        # 基于相似度与包含关系的字段映射
         metadata = self.dataset_manager.get_schema(args.dataset_id)
+        from difflib import SequenceMatcher
+        import re
+
+        def normalize(text: str) -> str:
+            return re.sub(r"[^0-9A-Za-z\u4e00-\u9fa5]+", "", text).lower()
 
         mapped_columns = []
+        suggestions: Dict[str, list] = {}
+
         for term in args.terms:
-            term_lower = term.lower()
+            term_norm = normalize(term)
+            scored = []
             for col in metadata.columns_schema:  # 使用新字段名
-                if term_lower in col.name.lower() or col.name.lower() in term_lower:
-                    if col.name not in mapped_columns:
-                        mapped_columns.append(col.name)
+                col_norm = normalize(col.name)
+                score = SequenceMatcher(None, term_norm, col_norm).ratio()
+                if term_norm and (term_norm in col_norm or col_norm in term_norm):
+                    score = min(1.0, score + 0.2)
+                scored.append((col.name, score))
+
+            scored.sort(key=lambda x: x[1], reverse=True)
+            suggestions[term] = [name for name, _ in scored[:5]]
+
+            if scored and scored[0][1] >= 0.65:
+                if scored[0][0] not in mapped_columns:
+                    mapped_columns.append(scored[0][0])
 
         return {
             "mapped_columns": mapped_columns,
-            "suggestions": {term: mapped_columns for term in args.terms}
+            "suggestions": suggestions
         }
 
 

@@ -43,7 +43,7 @@ SYSTEM_PROMPT = """你是一个数据分析规划助手。
 注意：
 - 必须调用工具，不要凭空回答
 - run_query 的 aggregations 参数是列表，每个元素包含 as, agg, col 三个字段
-- plot 工具需要传入 run_query 返回的数据
+- plot 工具需要传入 run_query 返回的数据（推荐 rows + columns）
 - resolve_fields 可以帮助你找到用户意图对应的真实字段名
 """
 
@@ -215,6 +215,7 @@ class LLMAgent:
             group_by: List[str] = None,
             aggregations: List[dict] = None,
             filters: List[dict] = None,
+            derived: List[dict] = None,
             sort: List[dict] = None,
             limit: int = 1000
         ) -> dict:
@@ -228,6 +229,8 @@ class LLMAgent:
                     支持的聚合函数: sum, avg, min, max, count, nunique
                 filters: 过滤条件列表，每个包含 col, op, value
                     例如: [{"col": "年份", "op": "=", "value": 2025}]
+                derived: 衍生字段列表，每个包含 as, expr
+                    例如: [{"as": "质量率", "expr": "quality_cnt / nullif(return_qty, 0)"}]
                 sort: 排序规则列表，每个包含 col, dir
                     例如: [{"col": "退货总数", "dir": "desc"}]
                 limit: 返回行数限制
@@ -240,7 +243,7 @@ class LLMAgent:
                 "filters": filters or [],
                 "group_by": group_by or [],
                 "aggregations": aggregations or [],
-                "derived": [],
+                "derived": derived or [],
                 "sort": sort or [],
                 "limit": limit
             })
@@ -249,7 +252,9 @@ class LLMAgent:
         def plot(
             chart_type: str,
             title: str,
-            data: List[dict],
+            data: List[dict] = None,
+            columns: List[str] = None,
+            rows: List[list] = None,
             x: str = None,
             y: str = None,
             series: str = None,
@@ -260,7 +265,9 @@ class LLMAgent:
             Args:
                 chart_type: 图表类型，支持 line(折线图), bar(柱状图), pie(饼图), scatter(散点图), area(面积图)
                 title: 图表标题
-                data: 图表数据，来自 run_query 的结果 rows
+                data: 图表数据（List[Dict] 或二维数组）
+                columns: 列名（当 data/rows 为二维数组时使用）
+                rows: 行数据（可替代 data，来自 run_query 的 rows）
                 x: X轴列名（饼图不需要）
                 y: Y轴列名（饼图不需要）
                 series: 系列分组列名（可选，用于多系列图表）
@@ -273,6 +280,8 @@ class LLMAgent:
                 "chart_type": chart_type,
                 "title": title,
                 "data": data,
+                "columns": columns,
+                "rows": rows,
                 "x": x,
                 "y": y,
                 "series": series,
@@ -483,6 +492,7 @@ class StreamingLLMAgent(LLMAgent):
             事件字典，包含 type 和相关数据
         """
         import time
+        import asyncio
 
         trace = TraceContext()
         log.info(f"开始流式分析: trace_id={trace.trace_id}")
@@ -506,13 +516,13 @@ class StreamingLLMAgent(LLMAgent):
             yield {"type": "step_start", "step": step + 1, "max_steps": self.max_steps}
 
             try:
-                response = self.llm_with_tools.invoke(messages)
+                response = await asyncio.to_thread(self.llm_with_tools.invoke, messages)
             except (OpenAIBadRequestError, OpenAIAPIError) as e:
                 error_msg = self._parse_api_error(e, "OpenAI")
                 log.error(f"OpenAI API 错误: {error_msg}")
                 yield {
                     "type": "error",
-                    "error": error_msg,
+                    "message": error_msg,
                     "trace": trace.to_dict()
                 }
                 return
@@ -521,7 +531,7 @@ class StreamingLLMAgent(LLMAgent):
                 log.error(f"Anthropic API 错误: {error_msg}")
                 yield {
                     "type": "error",
-                    "error": error_msg,
+                    "message": error_msg,
                     "trace": trace.to_dict()
                 }
                 return
@@ -530,7 +540,7 @@ class StreamingLLMAgent(LLMAgent):
                 log.error(error_msg)
                 yield {
                     "type": "error",
-                    "error": error_msg,
+                    "message": error_msg,
                     "trace": trace.to_dict()
                 }
                 return
@@ -589,7 +599,7 @@ class StreamingLLMAgent(LLMAgent):
 
                 try:
                     start = time.time()
-                    result = self.tool_executor.execute(tool_name, tool_args)
+                    result = await asyncio.to_thread(self.tool_executor.execute, tool_name, tool_args)
                     step_log.latency_ms = (time.time() - start) * 1000
                     step_log.result = result
 

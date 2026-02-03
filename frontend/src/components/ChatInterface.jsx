@@ -98,7 +98,7 @@ const ChatInterface = ({ dataset, llmConfig }) => {
               finalResult = event;
               break;
             case 'error':
-              message.error(event.message);
+              message.error(event.message || event.error || '请求失败');
               break;
           }
         }

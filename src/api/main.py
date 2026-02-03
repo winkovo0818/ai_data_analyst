@@ -2,15 +2,18 @@
 
 import json
 import shutil
+import uuid
 from pathlib import Path
 from typing import Optional, AsyncGenerator
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from src.core.config import settings
+from src.core.constants import SUPPORTED_FILE_EXTENSIONS
 from src.engines.dataset_manager import get_dataset_manager
 from src.engines.llm_agent import get_llm_agent, get_streaming_llm_agent
 from src.models.response import AnalysisResponse, UploadResponse, AuditInfo
@@ -75,14 +78,19 @@ async def upload_file(file: UploadFile = File(...)):
 
     支持格式：Excel (.xlsx, .xls), CSV (.csv)
     """
-    log.info(f"接收文件上传: {file.filename}")
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="文件名不能为空")
+
+    original_name = Path(file.filename).name
+    log.info(f"接收文件上传: {original_name}")
 
     # 检查文件类型
-    file_path = Path(file.filename)
-    if file_path.suffix.lower() not in ['.xlsx', '.xls', '.csv']:
+    file_path = Path(original_name)
+    suffix = file_path.suffix.lower()
+    if suffix not in SUPPORTED_FILE_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"不支持的文件类型: {file_path.suffix}"
+            detail=f"不支持的文件类型: {suffix}"
         )
 
     # 检查文件大小
@@ -98,7 +106,7 @@ async def upload_file(file: UploadFile = File(...)):
         )
 
     # 保存文件
-    file_id = file.filename
+    file_id = f"{uuid.uuid4().hex}{suffix}"
     save_path = settings.upload_dir / file_id
 
     try:
@@ -116,7 +124,7 @@ async def upload_file(file: UploadFile = File(...)):
 
         return UploadResponse(
             file_id=file_id,
-            filename=file.filename,
+            filename=original_name,
             size_bytes=size,
             sheets=sheets
         )
@@ -158,18 +166,19 @@ async def analyze(request: AnalysisRequest, req: Request):
         agent = get_llm_agent(llm_config)
 
         # 执行分析
-        result = agent.run(
+        result = await run_in_threadpool(
+            agent.run,
             user_query=request.question,
             dataset_id=request.dataset_id
         )
 
         # 构建响应
         return AnalysisResponse(
-            answer=result.get("answer", ""),
+            answer=result.get("answer") or "",
             tables=result.get("tables", []),
             charts=result.get("charts", []),
             audit=AuditInfo(**result["trace"]),
-            success=True,
+            success=result.get("error") is None,
             error=result.get("error")
         )
 
@@ -192,19 +201,23 @@ async def create_dataset(
         sheet: Excel Sheet 名称
         header_row: 表头行号
     """
-    log.info(f"创建数据集: file_id={file_id}")
+    safe_file_id = Path(file_id).name
+    if safe_file_id != file_id:
+        raise HTTPException(status_code=400, detail="非法文件ID")
+
+    log.info(f"创建数据集: file_id={safe_file_id}")
 
     try:
         dataset_manager = get_dataset_manager()
-        file_path = settings.upload_dir / file_id
+        file_path = settings.upload_dir / safe_file_id
 
         if not file_path.exists():
             raise HTTPException(status_code=404, detail="文件不存在")
 
         metadata = dataset_manager.create_dataset(
-            file_id=file_id,
+            file_id=safe_file_id,
             file_path=file_path,
-            original_filename=file_id,
+            original_filename=safe_file_id,
             sheet=sheet,
             header_row=header_row
         )

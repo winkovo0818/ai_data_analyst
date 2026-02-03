@@ -174,7 +174,7 @@ class DatasetManager:
         col_list = "*"
         if columns:
             # 验证列名存在
-            valid_cols = {c.name for c in metadata.schema}
+            valid_cols = {c.name for c in metadata.columns_schema}
             invalid_cols = set(columns) - valid_cols
             if invalid_cols:
                 raise ValueError(f"列不存在: {invalid_cols}")

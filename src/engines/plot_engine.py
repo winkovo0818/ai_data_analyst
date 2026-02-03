@@ -20,6 +20,9 @@ class PlotEngine:
         """
         log.info(f"生成图表: type={spec.chart_type}, title={spec.title}")
 
+        if not spec.data:
+            raise ValueError("图表数据为空，无法生成图表")
+
         # 根据图表类型生成 ECharts option
         if spec.chart_type == "line":
             option = self._generate_line_chart(spec)
@@ -41,23 +44,50 @@ class PlotEngine:
             image_base64=None  # TODO: 可选实现 matplotlib 生成 PNG
         )
 
+    def _validate_xy(self, spec: PlotSpec) -> None:
+        if not spec.x or not spec.y:
+            raise ValueError("图表必须提供 x 和 y 字段")
+
+    def _build_series(self, spec: PlotSpec) -> Dict[str, Any]:
+        """按 x 轴对齐构建 series 数据"""
+        self._validate_xy(spec)
+
+        x_data = []
+        x_seen = set()
+        series_points: Dict[str, Dict[Any, Any]] = {}
+
+        for row in spec.data:
+            if spec.x not in row or spec.y not in row:
+                raise ValueError("图表数据缺少必要字段")
+            x_val = row[spec.x]
+            y_val = row[spec.y]
+
+            if x_val not in x_seen:
+                x_seen.add(x_val)
+                x_data.append(x_val)
+
+            series_name = "数据"
+            if spec.series:
+                if spec.series not in row:
+                    raise ValueError("图表数据缺少 series 字段")
+                series_name = str(row[spec.series])
+
+            if series_name not in series_points:
+                series_points[series_name] = {}
+            series_points[series_name][x_val] = y_val
+
+        # 对齐到统一的 x 轴
+        aligned_series = {}
+        for name, points in series_points.items():
+            aligned_series[name] = [points.get(x) for x in x_data]
+
+        return {"x_data": x_data, "series": aligned_series}
+
     def _generate_line_chart(self, spec: PlotSpec) -> Dict[str, Any]:
         """生成折线图"""
-        # 提取数据
-        x_data = [row[spec.x] for row in spec.data] if spec.x else []
-
-        # 处理系列
-        series_data = {}
-        if spec.series:
-            # 多系列
-            for row in spec.data:
-                series_name = str(row[spec.series])
-                if series_name not in series_data:
-                    series_data[series_name] = []
-                series_data[series_name].append(row[spec.y])
-        else:
-            # 单系列
-            series_data["数据"] = [row[spec.y] for row in spec.data]
+        aligned = self._build_series(spec)
+        x_data = aligned["x_data"]
+        series_data = aligned["series"]
 
         # 构建 ECharts option
         option = {
@@ -89,17 +119,9 @@ class PlotEngine:
 
     def _generate_bar_chart(self, spec: PlotSpec) -> Dict[str, Any]:
         """生成柱状图"""
-        x_data = [row[spec.x] for row in spec.data] if spec.x else []
-
-        series_data = {}
-        if spec.series:
-            for row in spec.data:
-                series_name = str(row[spec.series])
-                if series_name not in series_data:
-                    series_data[series_name] = []
-                series_data[series_name].append(row[spec.y])
-        else:
-            series_data["数据"] = [row[spec.y] for row in spec.data]
+        aligned = self._build_series(spec)
+        x_data = aligned["x_data"]
+        series_data = aligned["series"]
 
         option = {
             "title": {"text": spec.title},
@@ -129,10 +151,14 @@ class PlotEngine:
 
     def _generate_pie_chart(self, spec: PlotSpec) -> Dict[str, Any]:
         """生成饼图"""
-        # 饼图不需要 x/y，使用第一个和第二个字段
-        keys = list(spec.data[0].keys())
-        name_key = keys[0]
-        value_key = keys[1] if len(keys) > 1 else keys[0]
+        if spec.x and spec.y:
+            name_key = spec.x
+            value_key = spec.y
+        else:
+            # 饼图不需要 x/y，使用第一个和第二个字段
+            keys = list(spec.data[0].keys())
+            name_key = keys[0]
+            value_key = keys[1] if len(keys) > 1 else keys[0]
 
         pie_data = [
             {"name": str(row[name_key]), "value": row[value_key]}
@@ -163,6 +189,9 @@ class PlotEngine:
 
     def _generate_scatter_chart(self, spec: PlotSpec) -> Dict[str, Any]:
         """生成散点图"""
+        self._validate_xy(spec)
+        if any(spec.x not in row or spec.y not in row for row in spec.data):
+            raise ValueError("图表数据缺少必要字段")
         scatter_data = [[row[spec.x], row[spec.y]] for row in spec.data]
 
         option = {
