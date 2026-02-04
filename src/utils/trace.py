@@ -12,6 +12,8 @@ class StepLog(BaseModel):
     args: Dict[str, Any]
     result: Any = None
     error: str | None = None
+    error_code: str | None = None
+    error_detail: Dict[str, Any] | None = None
     latency_ms: float = 0
     timestamp: datetime
 
@@ -39,6 +41,8 @@ class TraceContext:
                     "tool": s.tool,
                     "latency_ms": s.latency_ms,
                     "error": s.error,
+                    "error_code": s.error_code,
+                    "error_detail": s.error_detail,
                     "timestamp": s.timestamp.isoformat()
                 }
                 for s in self.steps

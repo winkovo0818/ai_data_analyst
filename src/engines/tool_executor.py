@@ -1,18 +1,29 @@
 """Tool Executor - 工具执行器"""
 
 import time
-from typing import Dict, Any
+import copy
+from typing import Dict, Any, Tuple
 from datetime import datetime
 from pathlib import Path
 
+from pydantic import ValidationError
 from src.tools import TOOL_REGISTRY
 from src.engines.dataset_manager import get_dataset_manager
-from src.engines.query_engine import get_query_engine
+from src.engines.query_engine import get_query_engine, QueryExecutionError
 from src.engines.plot_engine import get_plot_engine
 from src.models.query import QuerySpec
 from src.models.plot import PlotSpec
 from src.utils.logger import log
 from src.utils.trace import StepLog
+
+
+class ToolExecutionError(Exception):
+    """工具执行错误（结构化）"""
+
+    def __init__(self, code: str, message: str, detail: Dict[str, Any] | None = None):
+        super().__init__(message)
+        self.code = code
+        self.detail = detail or {}
 
 
 class ToolExecutor:
@@ -42,10 +53,17 @@ class ToolExecutor:
             if tool_name not in TOOL_REGISTRY:
                 raise ValueError(f"未知工具: {tool_name}")
 
-            # 验证参数
             tool_def = TOOL_REGISTRY[tool_name]
             input_schema = tool_def["input_schema"]
-            validated_args = input_schema(**args)
+            normalized_args = args
+            fixes: Dict[str, Any] = {}
+
+            if tool_name == "run_query":
+                normalized_args = self._normalize_run_query_args(args)
+                normalized_args, fixes = self._auto_fix_run_query_args(normalized_args)
+
+            # 验证参数
+            validated_args = input_schema(**normalized_args)
 
             # 执行工具
             if tool_name == "create_dataset":
@@ -68,10 +86,136 @@ class ToolExecutor:
 
             return result
 
+        except ValidationError as e:
+            latency = (time.time() - start_time) * 1000
+            log.error(f"工具执行失败: {tool_name} - {e} ({latency:.2f}ms)")
+            raise ToolExecutionError(
+                code="VALIDATION_ERROR",
+                message="参数校验失败",
+                detail={"errors": e.errors(), "fixes": fixes}
+            ) from e
+        except QueryExecutionError as e:
+            latency = (time.time() - start_time) * 1000
+            log.error(f"工具执行失败: {tool_name} - {e} ({latency:.2f}ms)")
+            raise ToolExecutionError(
+                code="SQL_ERROR",
+                message=str(e),
+                detail={"sql": e.sql, "params": e.params, "cause": e.cause}
+            ) from e
         except Exception as e:
             latency = (time.time() - start_time) * 1000
             log.error(f"工具执行失败: {tool_name} - {e} ({latency:.2f}ms)")
-            raise
+            raise ToolExecutionError(
+                code="TOOL_ERROR",
+                message=str(e),
+                detail={"exception": type(e).__name__}
+            ) from e
+
+    def _normalize_run_query_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """归一化 run_query 参数"""
+        normalized = copy.deepcopy(args)
+
+        def norm_op(value: str) -> str:
+            alias = {
+                "==": "=", "eq": "=", "neq": "!=", "gt": ">", "gte": ">=",
+                "lt": "<", "lte": "<=", "like": "like", "contains": "contains"
+            }
+            value = value.strip()
+            value_lower = value.lower()
+            return alias.get(value_lower, value_lower)
+
+        for f in normalized.get("filters", []) or []:
+            if isinstance(f.get("op"), str):
+                f["op"] = norm_op(f["op"])
+
+        for h in normalized.get("having", []) or []:
+            if isinstance(h.get("op"), str):
+                h["op"] = norm_op(h["op"])
+
+        for s in normalized.get("sort", []) or []:
+            if isinstance(s.get("dir"), str):
+                s["dir"] = s["dir"].lower()
+
+        top_k = normalized.get("top_k")
+        if top_k and isinstance(top_k.get("order"), str):
+            top_k["order"] = top_k["order"].lower()
+
+        time_bucket = normalized.get("time_bucket")
+        if time_bucket and isinstance(time_bucket.get("granularity"), str):
+            time_bucket["granularity"] = time_bucket["granularity"].lower()
+
+        return normalized
+
+    def _auto_fix_run_query_args(self, args: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """自动修正常见字段错误（保守策略）"""
+        dataset_id = args.get("dataset_id")
+        if not dataset_id:
+            return args, {}
+
+        metadata = self.dataset_manager.get_schema(dataset_id)
+        columns = [c.name for c in metadata.columns_schema]
+        col_set = set(columns)
+        fixes: Dict[str, Any] = {}
+
+        from difflib import SequenceMatcher
+
+        def best_match(name: str) -> str | None:
+            if name in col_set:
+                return name
+            for col in columns:
+                if col.lower() == name.lower():
+                    return col
+            best = None
+            best_score = 0.0
+            for col in columns:
+                score = SequenceMatcher(None, name.lower(), col.lower()).ratio()
+                if score > best_score:
+                    best_score = score
+                    best = col
+            if best_score >= 0.85:
+                return best
+            return None
+
+        def fix_field(container: Dict[str, Any], key: str, path: str):
+            value = container.get(key)
+            if isinstance(value, str):
+                mapped = best_match(value)
+                if mapped and mapped != value:
+                    container[key] = mapped
+                    fixes[path] = {"from": value, "to": mapped}
+
+        for f in args.get("filters", []) or []:
+            fix_field(f, "col", "filters.col")
+
+        for h in args.get("having", []) or []:
+            fix_field(h, "col", "having.col")
+
+        for agg in args.get("aggregations", []) or []:
+            if agg.get("col") != "*":
+                fix_field(agg, "col", "aggregations.col")
+
+        for col_index, col in enumerate(args.get("group_by", []) or []):
+            mapped = best_match(col)
+            if mapped and mapped != col:
+                args["group_by"][col_index] = mapped
+                fixes[f"group_by[{col_index}]"] = {"from": col, "to": mapped}
+
+        for s in args.get("sort", []) or []:
+            fix_field(s, "col", "sort.col")
+
+        top_k = args.get("top_k") or {}
+        if top_k:
+            fix_field(top_k, "by", "top_k.by")
+
+        time_bucket = args.get("time_bucket") or {}
+        if time_bucket:
+            fix_field(time_bucket, "col", "time_bucket.col")
+
+        for ratio in args.get("ratios", []) or []:
+            fix_field(ratio, "numerator", "ratios.numerator")
+            fix_field(ratio, "denominator", "ratios.denominator")
+
+        return args, fixes
 
     def _execute_create_dataset(self, args: Any) -> Dict[str, Any]:
         """执行 create_dataset"""

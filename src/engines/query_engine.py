@@ -12,6 +12,16 @@ from src.utils.logger import log
 from src.utils.security import SecurityValidator
 
 
+class QueryExecutionError(Exception):
+    """查询执行错误"""
+
+    def __init__(self, message: str, sql: str | None = None, params: List[Any] | None = None, cause: Exception | None = None):
+        super().__init__(message)
+        self.sql = sql
+        self.params = params or []
+        self.cause = str(cause) if cause else None
+
+
 class QueryCache:
     """简单的内存查询缓存"""
 
@@ -121,7 +131,7 @@ class QueryEngine:
             return result
         except Exception as e:
             log.error(f"查询执行失败: {e} | SQL: {sql} | params: {params}")
-            raise
+            raise QueryExecutionError("查询执行失败", sql=sql, params=params, cause=e) from e
         finally:
             conn.close()
 

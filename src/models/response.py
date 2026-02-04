@@ -29,6 +29,8 @@ class AnalysisResponse(BaseModel):
     audit: AuditInfo = Field(..., description="审计信息")
     success: bool = Field(True, description="是否成功")
     error: Optional[str] = Field(None, description="错误信息")
+    error_code: Optional[str] = Field(None, description="错误代码")
+    error_detail: Optional[Dict[str, Any]] = Field(None, description="错误详情")
 
 
 class UploadResponse(BaseModel):

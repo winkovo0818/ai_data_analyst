@@ -13,7 +13,7 @@ from openai import APIError as OpenAIAPIError, BadRequestError as OpenAIBadReque
 from anthropic import APIError as AnthropicAPIError, BadRequestError as AnthropicBadRequestError
 
 from src.core.config import settings
-from src.engines.tool_executor import get_tool_executor
+from src.engines.tool_executor import get_tool_executor, ToolExecutionError
 from src.utils.logger import log
 from src.utils.trace import TraceContext, StepLog
 
