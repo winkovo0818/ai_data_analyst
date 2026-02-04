@@ -87,7 +87,8 @@ const ChatInterface = ({ dataset, llmConfig }) => {
               if (event.success) {
                 setStreamingStatus(`${event.tool} 完成 (${event.latency_ms?.toFixed(0)}ms)`);
               } else {
-                setStreamingStatus(`${event.tool} 失败: ${event.error}`);
+                const codeLabel = event.error_code ? ` [${event.error_code}]` : '';
+                setStreamingStatus(`${event.tool} 失败${codeLabel}: ${event.error}`);
               }
               break;
             case 'answer_chunk':
@@ -97,19 +98,35 @@ const ChatInterface = ({ dataset, llmConfig }) => {
             case 'complete':
               finalResult = event;
               break;
+            case 'heartbeat':
+              break;
             case 'error':
-              message.error(event.message || event.error || '请求失败');
+              {
+                const codeLabel = event.error_code ? `(${event.error_code}) ` : '';
+                message.error(`${codeLabel}${event.message || event.error || '请求失败'}`);
+              }
               break;
           }
         }
       );
 
       if (finalResult) {
+        let assistantContent = finalResult.answer || '';
+        if (finalResult.error) {
+          assistantContent = finalResult.answer || finalResult.error;
+        }
+        if (finalResult.error_code) {
+          assistantContent = `${assistantContent}\n\n错误码: ${finalResult.error_code}`;
+        }
+
         const assistantMessage = {
           role: 'assistant',
-          content: finalResult.answer,
+          content: assistantContent,
           tables: finalResult.tables || [],
           charts: finalResult.charts || [],
+          error: Boolean(finalResult.error),
+          error_code: finalResult.error_code,
+          error_detail: finalResult.error_detail,
           audit: finalResult.trace ? {
             trace_id: finalResult.trace.trace_id,
             steps: finalResult.trace.steps,

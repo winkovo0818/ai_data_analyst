@@ -122,6 +122,9 @@ export const dataService = {
                 if (line.startsWith('data: ')) {
                   try {
                     const data = JSON.parse(line.slice(6));
+                    if (data.type === 'heartbeat') {
+                      continue;
+                    }
                     onEvent(data);
 
                     // 如果是完成事件，resolve
@@ -134,7 +137,10 @@ export const dataService = {
                     if (data.type === 'error') {
                       finished = true;
                       reader.cancel();
-                      reject(new Error(data.message || data.error || '请求失败'));
+                      const err = new Error(data.message || data.error || '请求失败');
+                      err.code = data.error_code;
+                      err.detail = data.error_detail;
+                      reject(err);
                       return;
                     }
                   } catch (e) {

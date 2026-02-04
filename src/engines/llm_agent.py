@@ -216,8 +216,12 @@ class LLMAgent:
             aggregations: List[dict] = None,
             filters: List[dict] = None,
             derived: List[dict] = None,
+            ratios: List[dict] = None,
+            time_bucket: dict = None,
+            having: List[dict] = None,
+            top_k: dict = None,
             sort: List[dict] = None,
-            limit: int = 1000
+            limit: int = 5000
         ) -> dict:
             """执行数据查询和聚合
 
@@ -231,6 +235,11 @@ class LLMAgent:
                     例如: [{"col": "年份", "op": "=", "value": 2025}]
                 derived: 衍生字段列表，每个包含 as, expr
                     例如: [{"as": "质量率", "expr": "quality_cnt / nullif(return_qty, 0)"}]
+                ratios: 比例/百分比指标列表（可选）
+                    例如: [{"as": "退货率", "numerator": "退货数量", "denominator": "销售数量", "kind": "percent"}]
+                time_bucket: 时间分桶（可选），包含 col, granularity, as
+                having: 聚合后过滤条件（可选），包含 col, op, value
+                top_k: Top K 规则（可选），包含 by, k, order
                 sort: 排序规则列表，每个包含 col, dir
                     例如: [{"col": "退货总数", "dir": "desc"}]
                 limit: 返回行数限制
@@ -244,6 +253,10 @@ class LLMAgent:
                 "group_by": group_by or [],
                 "aggregations": aggregations or [],
                 "derived": derived or [],
+                "ratios": ratios or [],
+                "time_bucket": time_bucket,
+                "having": having or [],
+                "top_k": top_k,
                 "sort": sort or [],
                 "limit": limit
             })
@@ -338,6 +351,7 @@ class LLMAgent:
                 response = self.llm_with_tools.invoke(messages)
             except (OpenAIBadRequestError, OpenAIAPIError) as e:
                 error_msg = self._parse_api_error(e, "OpenAI")
+                error_code = "LLM_BAD_REQUEST" if isinstance(e, OpenAIBadRequestError) else "LLM_API_ERROR"
                 log.error(f"OpenAI API 错误: {error_msg}")
                 return {
                     "answer": None,
@@ -345,10 +359,13 @@ class LLMAgent:
                     "tables": [],
                     "trace": trace.to_dict(),
                     "steps": step + 1,
-                    "error": error_msg
+                    "error": error_msg,
+                    "error_code": error_code,
+                    "error_detail": {"provider": "OpenAI", "exception": type(e).__name__}
                 }
             except (AnthropicBadRequestError, AnthropicAPIError) as e:
                 error_msg = self._parse_api_error(e, "Anthropic")
+                error_code = "LLM_BAD_REQUEST" if isinstance(e, AnthropicBadRequestError) else "LLM_API_ERROR"
                 log.error(f"Anthropic API 错误: {error_msg}")
                 return {
                     "answer": None,
@@ -356,7 +373,9 @@ class LLMAgent:
                     "tables": [],
                     "trace": trace.to_dict(),
                     "steps": step + 1,
-                    "error": error_msg
+                    "error": error_msg,
+                    "error_code": error_code,
+                    "error_detail": {"provider": "Anthropic", "exception": type(e).__name__}
                 }
             except Exception as e:
                 error_msg = f"LLM 调用失败: {str(e)}"
@@ -367,7 +386,9 @@ class LLMAgent:
                     "tables": [],
                     "trace": trace.to_dict(),
                     "steps": step + 1,
-                    "error": error_msg
+                    "error": error_msg,
+                    "error_code": "LLM_CALL_FAILED",
+                    "error_detail": {"exception": type(e).__name__}
                 }
 
             # 提取 token 使用量
@@ -459,13 +480,33 @@ class LLMAgent:
 
                     log.info(f"工具执行成功: {tool_name}")
 
-                except Exception as e:
+                except ToolExecutionError as e:
                     step_log.error = str(e)
+                    step_log.error_code = e.code
+                    step_log.error_detail = e.detail
                     log.error(f"工具执行失败: {tool_name} - {e}")
 
                     messages.append(
                         ToolMessage(
-                            content=f"错误: {str(e)}",
+                            content=json.dumps(
+                                {"error": str(e), "code": e.code, "detail": e.detail},
+                                ensure_ascii=False
+                            ),
+                            tool_call_id=tool_call["id"]
+                        )
+                    )
+                except Exception as e:
+                    step_log.error = str(e)
+                    step_log.error_code = "TOOL_ERROR"
+                    step_log.error_detail = {"exception": type(e).__name__}
+                    log.error(f"工具执行失败: {tool_name} - {e}")
+
+                    messages.append(
+                        ToolMessage(
+                            content=json.dumps(
+                                {"error": str(e), "code": "TOOL_ERROR"},
+                                ensure_ascii=False
+                            ),
                             tool_call_id=tool_call["id"]
                         )
                     )
@@ -477,7 +518,9 @@ class LLMAgent:
             "answer": "抱歉，分析步骤超过限制，请简化问题或联系管理员。",
             "trace": trace.to_dict(),
             "steps": self.max_steps,
-            "error": "达到最大步数限制"
+            "error": "达到最大步数限制",
+            "error_code": "MAX_STEPS_EXCEEDED",
+            "error_detail": {"max_steps": self.max_steps}
         }
 
 
@@ -519,20 +562,26 @@ class StreamingLLMAgent(LLMAgent):
                 response = await asyncio.to_thread(self.llm_with_tools.invoke, messages)
             except (OpenAIBadRequestError, OpenAIAPIError) as e:
                 error_msg = self._parse_api_error(e, "OpenAI")
+                error_code = "LLM_BAD_REQUEST" if isinstance(e, OpenAIBadRequestError) else "LLM_API_ERROR"
                 log.error(f"OpenAI API 错误: {error_msg}")
                 yield {
                     "type": "error",
                     "message": error_msg,
-                    "trace": trace.to_dict()
+                    "trace": trace.to_dict(),
+                    "error_code": error_code,
+                    "error_detail": {"provider": "OpenAI", "exception": type(e).__name__}
                 }
                 return
             except (AnthropicBadRequestError, AnthropicAPIError) as e:
                 error_msg = self._parse_api_error(e, "Anthropic")
+                error_code = "LLM_BAD_REQUEST" if isinstance(e, AnthropicBadRequestError) else "LLM_API_ERROR"
                 log.error(f"Anthropic API 错误: {error_msg}")
                 yield {
                     "type": "error",
                     "message": error_msg,
-                    "trace": trace.to_dict()
+                    "trace": trace.to_dict(),
+                    "error_code": error_code,
+                    "error_detail": {"provider": "Anthropic", "exception": type(e).__name__}
                 }
                 return
             except Exception as e:
@@ -541,7 +590,9 @@ class StreamingLLMAgent(LLMAgent):
                 yield {
                     "type": "error",
                     "message": error_msg,
-                    "trace": trace.to_dict()
+                    "trace": trace.to_dict(),
+                    "error_code": "LLM_CALL_FAILED",
+                    "error_detail": {"exception": type(e).__name__}
                 }
                 return
 
@@ -629,13 +680,18 @@ class StreamingLLMAgent(LLMAgent):
                         "latency_ms": step_log.latency_ms
                     }
 
-                except Exception as e:
+                except ToolExecutionError as e:
                     step_log.error = str(e)
+                    step_log.error_code = e.code
+                    step_log.error_detail = e.detail
                     log.error(f"工具执行失败: {tool_name} - {e}")
 
                     messages.append(
                         ToolMessage(
-                            content=f"错误: {str(e)}",
+                            content=json.dumps(
+                                {"error": str(e), "code": e.code, "detail": e.detail},
+                                ensure_ascii=False
+                            ),
                             tool_call_id=tool_call["id"]
                         )
                     )
@@ -644,7 +700,33 @@ class StreamingLLMAgent(LLMAgent):
                         "type": "tool_result",
                         "tool": tool_name,
                         "success": False,
-                        "error": str(e)
+                        "error": str(e),
+                        "error_code": e.code,
+                        "error_detail": e.detail
+                    }
+                except Exception as e:
+                    step_log.error = str(e)
+                    step_log.error_code = "TOOL_ERROR"
+                    step_log.error_detail = {"exception": type(e).__name__}
+                    log.error(f"工具执行失败: {tool_name} - {e}")
+
+                    messages.append(
+                        ToolMessage(
+                            content=json.dumps(
+                                {"error": str(e), "code": "TOOL_ERROR"},
+                                ensure_ascii=False
+                            ),
+                            tool_call_id=tool_call["id"]
+                        )
+                    )
+
+                    yield {
+                        "type": "tool_result",
+                        "tool": tool_name,
+                        "success": False,
+                        "error": str(e),
+                        "error_code": "TOOL_ERROR",
+                        "error_detail": {"exception": type(e).__name__}
                     }
 
                 trace.add_step(step_log)
@@ -657,7 +739,9 @@ class StreamingLLMAgent(LLMAgent):
             "tables": tables,
             "trace": trace.to_dict(),
             "steps": self.max_steps,
-            "error": "达到最大步数限制"
+            "error": "达到最大步数限制",
+            "error_code": "MAX_STEPS_EXCEEDED",
+            "error_detail": {"max_steps": self.max_steps}
         }
 
 

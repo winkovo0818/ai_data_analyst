@@ -1,10 +1,12 @@
 """FastAPI 主应用"""
 
 import json
+import asyncio
 import shutil
 import uuid
 from pathlib import Path
 from typing import Optional, AsyncGenerator
+from datetime import datetime
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from fastapi.concurrency import run_in_threadpool
@@ -179,7 +181,9 @@ async def analyze(request: AnalysisRequest, req: Request):
             charts=result.get("charts", []),
             audit=AuditInfo(**result["trace"]),
             success=result.get("error") is None,
-            error=result.get("error")
+            error=result.get("error"),
+            error_code=result.get("error_code"),
+            error_detail=result.get("error_detail")
         )
 
     except Exception as e:
@@ -271,6 +275,7 @@ async def analyze_stream(request: AnalysisRequest, req: Request):
         )
 
     async def event_generator() -> AsyncGenerator[str, None]:
+        heartbeat_interval = 10
         try:
             # 准备 LLM 配置
             llm_config = None
@@ -281,16 +286,56 @@ async def analyze_stream(request: AnalysisRequest, req: Request):
             agent = get_streaming_llm_agent(llm_config)
 
             # 执行流式分析
-            async for event in agent.run_stream(
-                user_query=request.question,
-                dataset_id=request.dataset_id
-            ):
-                # SSE 格式: data: {json}\n\n
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            queue: asyncio.Queue = asyncio.Queue()
 
+            async def pump_events():
+                try:
+                    async for event in agent.run_stream(
+                        user_query=request.question,
+                        dataset_id=request.dataset_id
+                    ):
+                        await queue.put(("event", event))
+                except Exception as exc:
+                    await queue.put(("error", exc))
+                finally:
+                    await queue.put(("done", None))
+
+            pump_task = asyncio.create_task(pump_events())
+
+            try:
+                while True:
+                    try:
+                        kind, payload = await asyncio.wait_for(queue.get(), timeout=heartbeat_interval)
+                    except asyncio.TimeoutError:
+                        heartbeat = {
+                            "type": "heartbeat",
+                            "ts": datetime.utcnow().isoformat() + "Z"
+                        }
+                        yield f"data: {json.dumps(heartbeat, ensure_ascii=False)}\n\n"
+                        continue
+
+                    if kind == "event":
+                        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    elif kind == "error":
+                        log.error(f"流式分析失败: {payload}")
+                        error_event = {
+                            "type": "error",
+                            "message": str(payload),
+                            "error_code": "STREAM_ERROR"
+                        }
+                        yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+                        return
+                    elif kind == "done":
+                        break
+            finally:
+                pump_task.cancel()
+
+        except asyncio.CancelledError:
+            log.info("流式连接已取消")
+            return
         except Exception as e:
             log.error(f"流式分析失败: {e}")
-            error_event = {"type": "error", "message": str(e)}
+            error_event = {"type": "error", "message": str(e), "error_code": "STREAM_ERROR"}
             yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
