@@ -108,8 +108,20 @@ const ListRenderer = ({ items }) => (
 );
 
 // 核心渲染逻辑
+const sanitizeContent = (raw) => {
+  if (!raw) return raw;
+  const lines = raw.split('\n');
+  const filtered = lines.filter(line => {
+    const trimmed = line.trim();
+    if (!trimmed) return true;
+    return !/!\[[^\]]*]\(data:image\/png;base64,[^)]*\)/i.test(trimmed);
+  });
+  return filtered.join('\n');
+};
+
 const FormattedContent = ({ content }) => {
-  const lines = content.split('\n');
+  const safeContent = sanitizeContent(content);
+  const lines = safeContent.split('\n');
   const elements = [];
   
   let currentList = [];

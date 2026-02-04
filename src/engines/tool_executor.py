@@ -387,6 +387,7 @@ class ToolExecutor:
         x = payload.get("x")
         y = payload.get("y")
         series = payload.get("series")
+        data_rows = payload.get("data", [])
 
         if payload.get("y_format") in (None, "auto") and x and y and chart_type not in (None, "auto"):
             recommendation = self.plot_engine.recommend(
@@ -398,6 +399,15 @@ class ToolExecutor:
             payload["y_format"] = recommendation.get("y_format", payload.get("y_format"))
             if series is None:
                 payload["series"] = recommendation.get("series")
+                series = payload.get("series")
+
+        if series and data_rows:
+            if not any(series in row for row in data_rows):
+                payload["series"] = None
+                series = None
+                if chart_type == "heatmap":
+                    payload["chart_type"] = "bar"
+                    chart_type = "bar"
 
         if chart_type in (None, "auto") or not x or not y:
             recommendation = self.plot_engine.recommend(

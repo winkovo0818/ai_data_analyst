@@ -252,6 +252,9 @@ class PlotEngine:
         x_data = []
         x_seen = set()
         series_points: Dict[str, Dict[Any, Any]] = {}
+        series_col = spec.series
+        if series_col and not any(series_col in row for row in spec.data):
+            series_col = None
 
         for row in spec.data:
             if spec.x not in row or spec.y not in row:
@@ -264,10 +267,11 @@ class PlotEngine:
                 x_data.append(x_val)
 
             series_name = "数据"
-            if spec.series:
-                if spec.series not in row:
-                    raise ValueError("图表数据缺少 series 字段")
-                series_name = str(row[spec.series])
+            if series_col:
+                if series_col not in row:
+                    series_name = "未知"
+                else:
+                    series_name = str(row[series_col])
 
             if series_name not in series_points:
                 series_points[series_name] = {}
