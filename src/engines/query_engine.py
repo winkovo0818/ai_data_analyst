@@ -5,6 +5,7 @@ import hashlib
 import json
 import duckdb
 from typing import List, Any, Dict, Optional, Tuple, Set
+from datetime import datetime, date
 from src.models.query import QuerySpec, QueryResult, FilterCondition, DerivedField, RatioMetric
 from src.engines.dataset_manager import get_dataset_manager
 from src.core.config import settings
@@ -118,9 +119,13 @@ class QueryEngine:
 
             execution_time = (time.time() - start_time) * 1000
 
+            rows = [
+                [self._normalize_value(v) for v in row]
+                for row in result_df.values.tolist()
+            ]
             result = QueryResult(
                 columns=result_df.columns.tolist(),
-                rows=result_df.values.tolist(),
+                rows=rows,
                 row_count=len(result_df),
                 execution_time_ms=round(execution_time, 2)
             )
@@ -144,9 +149,42 @@ class QueryEngine:
         """转义 LIKE 模式字符"""
         return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
-    def _build_time_bucket(self, col: str, granularity: str) -> str:
+    def _parse_datetime_expr(self, col: str, col_type: str | None = None) -> str:
+        """构建安全的日期时间解析表达式（支持多种常见格式）"""
+        quoted = self._quote_identifier(col)
+        if col_type == "datetime":
+            return quoted
+        if col_type != "string":
+            return f"TRY_CAST({quoted} AS TIMESTAMP)"
+
+        return (
+            "CASE "
+            f"WHEN regexp_matches({quoted}, '^\\\\d{{4}}-\\\\d{{2}}-\\\\d{{2}}\\\\s+\\\\d{{2}}:\\\\d{{2}}:\\\\d{{2}}$') "
+            f"THEN STRPTIME({quoted}, '%Y-%m-%d %H:%M:%S') "
+            f"WHEN regexp_matches({quoted}, '^\\\\d{{4}}-\\\\d{{2}}-\\\\d{{2}}\\\\s+\\\\d{{2}}:\\\\d{{2}}$') "
+            f"THEN STRPTIME({quoted}, '%Y-%m-%d %H:%M') "
+            f"WHEN regexp_matches({quoted}, '^\\\\d{{4}}-\\\\d{{2}}-\\\\d{{2}}$') "
+            f"THEN STRPTIME({quoted}, '%Y-%m-%d') "
+            f"WHEN regexp_matches({quoted}, '^\\\\d{{4}}/\\\\d{{2}}/\\\\d{{2}}\\\\s+\\\\d{{2}}:\\\\d{{2}}:\\\\d{{2}}$') "
+            f"THEN STRPTIME({quoted}, '%Y/%m/%d %H:%M:%S') "
+            f"WHEN regexp_matches({quoted}, '^\\\\d{{4}}/\\\\d{{2}}/\\\\d{{2}}\\\\s+\\\\d{{2}}:\\\\d{{2}}$') "
+            f"THEN STRPTIME({quoted}, '%Y/%m/%d %H:%M') "
+            f"WHEN regexp_matches({quoted}, '^\\\\d{{4}}/\\\\d{{2}}/\\\\d{{2}}$') "
+            f"THEN STRPTIME({quoted}, '%Y/%m/%d') "
+            f"ELSE TRY_CAST({quoted} AS TIMESTAMP) "
+            "END"
+        )
+
+    def _build_time_bucket(self, col: str, granularity: str, col_type: str | None = None) -> str:
         """构建时间分桶表达式"""
-        return f"DATE_TRUNC('{granularity}', {self._quote_identifier(col)})"
+        parsed = self._parse_datetime_expr(col, col_type)
+        return f"DATE_TRUNC('{granularity}', {parsed})"
+
+    def _get_column_type(self, metadata, col: str) -> str | None:
+        for item in metadata.columns_schema:
+            if item.name == col:
+                return item.type
+        return None
 
     def _build_ratio_fields(self, ratios: List[RatioMetric]) -> List[DerivedField]:
         """构建比例/百分比衍生字段"""
@@ -172,6 +210,9 @@ class QueryEngine:
         if spec.time_bucket:
             if spec.time_bucket.col not in available_cols:
                 raise ValueError(f"时间分桶列不存在: {spec.time_bucket.col}")
+            col_type = self._get_column_type(metadata, spec.time_bucket.col)
+            if col_type and col_type not in ("datetime", "string"):
+                raise ValueError(f"时间分桶仅支持日期/字符串列: {spec.time_bucket.col}")
             time_bucket_alias = spec.time_bucket.as_
             group_cols.append(time_bucket_alias)
 
@@ -241,7 +282,8 @@ class QueryEngine:
         group_by_exprs: List[str] = []
 
         if spec.time_bucket:
-            bucket_expr = self._build_time_bucket(spec.time_bucket.col, spec.time_bucket.granularity)
+            col_type = self._get_column_type(metadata, spec.time_bucket.col)
+            bucket_expr = self._build_time_bucket(spec.time_bucket.col, spec.time_bucket.granularity, col_type)
             select_parts.append(f'{bucket_expr} AS {self._quote_identifier(spec.time_bucket.as_)}')
             output_columns.append(spec.time_bucket.as_)
             group_by_exprs.append(bucket_expr)
@@ -291,7 +333,7 @@ class QueryEngine:
 
         # GROUP BY 子句
         group_clause = ""
-        if has_grouping:
+        if group_by_exprs:
             group_clause = f"GROUP BY {', '.join(group_by_exprs)}"
 
         base_sql_parts = [
@@ -373,7 +415,38 @@ class QueryEngine:
             return f"{col} LIKE ?", [value]
         if op == "is_null":
             return f"{col} IS NULL", []
+        if op == "is_not_null":
+            return f"{col} IS NOT NULL", []
         raise ValueError(f"不支持的操作符: {op}")
+
+    def _normalize_value(self, value: Any) -> Any:
+        if value is None:
+            return None
+        try:
+            import pandas as pd
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+
+        if isinstance(value, (datetime, date)):
+            return value.isoformat()
+
+        try:
+            import pandas as pd
+            if isinstance(value, pd.Timestamp):
+                return value.to_pydatetime().isoformat()
+        except Exception:
+            pass
+
+        try:
+            import numpy as np
+            if isinstance(value, np.generic):
+                return value.item()
+        except Exception:
+            pass
+
+        return value
 
 
 # 全局单例

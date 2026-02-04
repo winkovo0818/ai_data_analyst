@@ -8,7 +8,7 @@ SUPPORTED_FILE_EXTENSIONS: Set[str] = {".xlsx", ".xls", ".csv"}
 # QuerySpec 操作符白名单
 ALLOWED_FILTER_OPERATORS: Set[str] = {
     "=", "!=", ">", ">=", "<", "<=",
-    "in", "between", "contains", "like", "is_null"
+    "in", "between", "contains", "like", "is_null", "is_not_null"
 }
 
 # 聚合函数白名单

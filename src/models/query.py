@@ -13,7 +13,7 @@ from src.core.constants import (
 class FilterCondition(BaseModel):
     """过滤条件"""
     col: str = Field(..., description="列名")
-    op: str = Field(..., description="操作符: =, !=, >, >=, <, <=, in, between, contains, like, is_null")
+    op: str = Field(..., description="操作符: =, !=, >, >=, <, <=, in, between, contains, like, is_null, is_not_null")
     value: Any = Field(None, description="过滤值")
 
     @field_validator('op')

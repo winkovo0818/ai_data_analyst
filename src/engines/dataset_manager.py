@@ -6,6 +6,7 @@ import pandas as pd
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
+import re
 
 from src.core.config import settings
 from src.core.constants import DTYPE_MAPPING, MAX_COLUMNS, MAX_ROWS_SAMPLE
@@ -31,6 +32,131 @@ class DatasetManager:
         """标准化数据类型"""
         dtype_str = str(dtype)
         return DTYPE_MAPPING.get(dtype_str, "string")
+
+    def _normalize_duckdb_type(self, dtype: str) -> str:
+        """标准化 DuckDB 类型"""
+        dtype_upper = str(dtype).upper()
+        if "INT" in dtype_upper:
+            return "int"
+        if any(t in dtype_upper for t in ["DOUBLE", "FLOAT", "DECIMAL", "NUMERIC"]):
+            return "float"
+        if "BOOL" in dtype_upper:
+            return "boolean"
+        if any(t in dtype_upper for t in ["DATE", "TIMESTAMP"]):
+            return "datetime"
+        return "string"
+
+    def _quote_identifier(self, name: str) -> str:
+        escaped = name.replace('"', '""')
+        return f'"{escaped}"'
+
+    def _normalize_sample_value(self, value: Any) -> Any:
+        if value is None:
+            return None
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
+
+        try:
+            import numpy as np
+            if isinstance(value, np.generic):
+                value = value.item()
+        except Exception:
+            pass
+
+        if isinstance(value, (datetime, pd.Timestamp)):
+            return value.to_pydatetime().isoformat()
+        return value
+
+    def _table_exists(self, table_name: str) -> bool:
+        if not re.fullmatch(r"[A-Za-z0-9_]+", table_name):
+            return False
+        conn = self._get_connection()
+        try:
+            result = conn.execute(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?",
+                [table_name]
+            ).fetchone()
+            return bool(result and result[0] > 0)
+        finally:
+            conn.close()
+
+    def _load_metadata_from_duckdb(self, dataset_id: str) -> Optional[DatasetMetadata]:
+        table_name = f"dataset_{dataset_id}"
+        if not self._table_exists(table_name):
+            return None
+
+        conn = self._get_connection()
+        try:
+            row_count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+            table_info = conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+
+            schema: List[ColumnSchema] = []
+            for row in table_info:
+                col_name = row[1]
+                raw_type = row[2]
+                dtype = self._normalize_duckdb_type(raw_type)
+
+                null_ratio = 0.0
+                unique_count = None
+                example_values: List[Any] = []
+                min_value = None
+                max_value = None
+
+                if row_count > 0:
+                    col_expr = self._quote_identifier(col_name)
+                    non_null = conn.execute(
+                        f"SELECT COUNT({col_expr}) FROM {table_name}"
+                    ).fetchone()[0]
+                    null_ratio = round((row_count - non_null) / row_count, 4) if row_count else 0.0
+
+                    sample_rows = conn.execute(
+                        f"SELECT {col_expr} FROM {table_name} WHERE {col_expr} IS NOT NULL LIMIT 3"
+                    ).fetchall()
+                    example_values = [self._normalize_sample_value(v[0]) for v in sample_rows]
+
+                    unique_count = conn.execute(
+                        f"SELECT COUNT(DISTINCT {col_expr}) FROM {table_name}"
+                    ).fetchone()[0]
+
+                    if dtype in ["int", "float", "datetime"]:
+                        min_value, max_value = conn.execute(
+                            f"SELECT MIN({col_expr}), MAX({col_expr}) FROM {table_name}"
+                        ).fetchone()
+                        min_value = self._normalize_sample_value(min_value)
+                        max_value = self._normalize_sample_value(max_value)
+                        if dtype in ["int", "float"]:
+                            min_value = float(min_value) if min_value is not None else None
+                            max_value = float(max_value) if max_value is not None else None
+
+                col_schema = ColumnSchema(
+                    name=str(col_name),
+                    type=dtype,
+                    null_ratio=null_ratio,
+                    example_values=example_values,
+                    unique_count=unique_count,
+                    min_value=min_value,
+                    max_value=max_value
+                )
+                schema.append(col_schema)
+
+            metadata = DatasetMetadata(
+                dataset_id=dataset_id,
+                source_type="duckdb",
+                original_filename=dataset_id,
+                file_path="",
+                sheet_name=None,
+                row_count=row_count,
+                column_count=len(schema),
+                columns_schema=schema,
+                created_at=datetime.now(),
+                size_bytes=0
+            )
+            return metadata
+        finally:
+            conn.close()
 
     def create_dataset(
         self,
@@ -157,7 +283,11 @@ class DatasetManager:
         if dataset_id in self.datasets:
             return self.datasets[dataset_id]
 
-        # TODO: 从持久化存储中加载
+        recovered = self._load_metadata_from_duckdb(dataset_id)
+        if recovered:
+            self.datasets[dataset_id] = recovered
+            return recovered
+
         raise ValueError(f"数据集不存在: {dataset_id}")
 
     def sample_rows(
@@ -195,7 +325,9 @@ class DatasetManager:
 
     def dataset_exists(self, dataset_id: str) -> bool:
         """检查数据集是否存在"""
-        return dataset_id in self.datasets
+        if dataset_id in self.datasets:
+            return True
+        return self._table_exists(f"dataset_{dataset_id}")
 
     def get_table_name(self, dataset_id: str) -> str:
         """获取数据集对应的 DuckDB 表名"""
@@ -254,10 +386,11 @@ class DatasetManager:
 
         # 删除上传的文件（可选）
         try:
-            file_path = Path(metadata.file_path)
-            if file_path.exists():
-                file_path.unlink()
-                log.info(f"已删除文件: {file_path}")
+            if metadata.file_path:
+                file_path = Path(metadata.file_path)
+                if file_path.exists() and file_path.is_file():
+                    file_path.unlink()
+                    log.info(f"已删除文件: {file_path}")
         except Exception as e:
             log.warning(f"删除文件失败: {e}")
 

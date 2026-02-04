@@ -250,9 +250,9 @@ const ChatInterface = ({ dataset, llmConfig }) => {
                 {msg.tables && msg.tables.length > 0 && (
                   <div style={{ marginTop: 16 }}>
                      {msg.tables.map((table, i) => (
-                      <Card key={i} size="small" title={<Space><TableOutlined /> 数据预览</Space>} style={{ marginTop: 12 }}>
+                      <div key={i} style={{ marginTop: 12 }}>
                         <TableDisplay table={table} />
-                      </Card>
+                      </div>
                     ))}
                   </div>
                 )}
@@ -261,9 +261,9 @@ const ChatInterface = ({ dataset, llmConfig }) => {
                 {msg.charts && msg.charts.length > 0 && (
                   <div style={{ marginTop: 16 }}>
                     {msg.charts.map((chart, i) => (
-                      <Card key={i} size="small" title={<Space><BarChartOutlined /> 可视化分析</Space>} style={{ marginTop: 12 }}>
+                      <div key={i} style={{ marginTop: 12 }}>
                         <ChartDisplay chart={chart} />
-                      </Card>
+                      </div>
                     ))}
                   </div>
                 )}

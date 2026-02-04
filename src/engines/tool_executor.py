@@ -89,10 +89,11 @@ class ToolExecutor:
         except ValidationError as e:
             latency = (time.time() - start_time) * 1000
             log.error(f"工具执行失败: {tool_name} - {e} ({latency:.2f}ms)")
+            detail = self._make_json_safe({"errors": e.errors(), "fixes": fixes})
             raise ToolExecutionError(
                 code="VALIDATION_ERROR",
                 message="参数校验失败",
-                detail={"errors": e.errors(), "fixes": fixes}
+                detail=detail
             ) from e
         except QueryExecutionError as e:
             latency = (time.time() - start_time) * 1000
@@ -100,7 +101,7 @@ class ToolExecutor:
             raise ToolExecutionError(
                 code="SQL_ERROR",
                 message=str(e),
-                detail={"sql": e.sql, "params": e.params, "cause": e.cause}
+                detail=self._make_json_safe({"sql": e.sql, "params": e.params, "cause": e.cause})
             ) from e
         except Exception as e:
             latency = (time.time() - start_time) * 1000
@@ -108,7 +109,7 @@ class ToolExecutor:
             raise ToolExecutionError(
                 code="TOOL_ERROR",
                 message=str(e),
-                detail={"exception": type(e).__name__}
+                detail=self._make_json_safe({"exception": type(e).__name__})
             ) from e
 
     def _normalize_run_query_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -118,7 +119,10 @@ class ToolExecutor:
         def norm_op(value: str) -> str:
             alias = {
                 "==": "=", "eq": "=", "neq": "!=", "gt": ">", "gte": ">=",
-                "lt": "<", "lte": "<=", "like": "like", "contains": "contains"
+                "lt": "<", "lte": "<=", "like": "like", "contains": "contains",
+                "not null": "is_not_null", "is not null": "is_not_null",
+                "not_null": "is_not_null", "is_not_null": "is_not_null",
+                "null": "is_null", "is null": "is_null", "is_null": "is_null"
             }
             value = value.strip()
             value_lower = value.lower()
@@ -184,6 +188,31 @@ class ToolExecutor:
                     container[key] = mapped
                     fixes[path] = {"from": value, "to": mapped}
 
+        def guess_time_granularity(label: str) -> str | None:
+            if not isinstance(label, str):
+                return None
+            text = label.lower()
+            rules = [
+                (["year", "年份", "年"], "year"),
+                (["quarter", "季度", "季"], "quarter"),
+                (["month", "月份", "月"], "month"),
+                (["week", "周", "星期"], "week"),
+                (["day", "日期", "日", "天"], "day"),
+                (["hour", "小时", "时"], "hour"),
+            ]
+            for keys, granularity in rules:
+                for key in keys:
+                    if key in text:
+                        return granularity
+            return None
+
+        date_cols = [c.name for c in metadata.columns_schema if c.type == "datetime"]
+        if not date_cols:
+            date_keywords = ["日期", "时间", "time", "date", "年月", "月份", "季度", "周", "日", "天"]
+            for c in metadata.columns_schema:
+                if c.type == "string" and any(k in c.name.lower() for k in date_keywords):
+                    date_cols.append(c.name)
+
         for f in args.get("filters", []) or []:
             fix_field(f, "col", "filters.col")
 
@@ -194,18 +223,90 @@ class ToolExecutor:
             if agg.get("col") != "*":
                 fix_field(agg, "col", "aggregations.col")
 
-        for col_index, col in enumerate(args.get("group_by", []) or []):
+        original_group_by = list(args.get("group_by", []) or [])
+        new_group_by = []
+        time_bucket = args.get("time_bucket") or {}
+
+        for col_index, col in enumerate(original_group_by):
             mapped = best_match(col)
             if mapped and mapped != col:
-                args["group_by"][col_index] = mapped
+                new_group_by.append(mapped)
                 fixes[f"group_by[{col_index}]"] = {"from": col, "to": mapped}
+                continue
+
+            granularity = guess_time_granularity(col)
+            if granularity and date_cols:
+                if not time_bucket:
+                    time_bucket = {
+                        "col": date_cols[0],
+                        "granularity": granularity,
+                        "as": col
+                    }
+                    args["time_bucket"] = time_bucket
+                    fixes[f"group_by[{col_index}]"] = {
+                        "from": col,
+                        "to": f"time_bucket({date_cols[0]}, {granularity}, as={col})",
+                        "reason": "time_keyword"
+                    }
+                else:
+                    if not time_bucket.get("as"):
+                        time_bucket["as"] = col
+                        args["time_bucket"] = time_bucket
+                    fixes[f"group_by[{col_index}]"] = {
+                        "from": col,
+                        "to": "time_bucket",
+                        "reason": "time_keyword"
+                    }
+                continue
+
+            new_group_by.append(col)
+
+        args["group_by"] = new_group_by
 
         for s in args.get("sort", []) or []:
             fix_field(s, "col", "sort.col")
 
+        aggregations = args.get("aggregations", []) or []
+        agg_col_map: Dict[str, list] = {}
+        for agg in aggregations:
+            col = agg.get("col")
+            alias = agg.get("as")
+            agg_fn = agg.get("agg")
+            if isinstance(col, str) and isinstance(alias, str):
+                agg_col_map.setdefault(col, []).append({"alias": alias, "agg": agg_fn})
+
+        def pick_agg_alias(col: str) -> str | None:
+            candidates = agg_col_map.get(col) or []
+            if not candidates:
+                return None
+            if len(candidates) == 1:
+                return candidates[0]["alias"]
+            priority = ["sum", "avg", "max", "min", "count", "nunique"]
+            for p in priority:
+                for item in candidates:
+                    if item.get("agg") == p:
+                        return item["alias"]
+            return candidates[0]["alias"]
+
+        for s in args.get("sort", []) or []:
+            col = s.get("col")
+            if isinstance(col, str) and col in agg_col_map:
+                mapped = pick_agg_alias(col)
+                if mapped and mapped != col:
+                    s["col"] = mapped
+                    reason = "agg_alias" if len(agg_col_map[col]) == 1 else "agg_alias_priority"
+                    fixes["sort.col"] = {"from": col, "to": mapped, "reason": reason}
+
         top_k = args.get("top_k") or {}
         if top_k:
             fix_field(top_k, "by", "top_k.by")
+            by = top_k.get("by")
+            if isinstance(by, str) and by in agg_col_map:
+                mapped = pick_agg_alias(by)
+                if mapped and mapped != by:
+                    top_k["by"] = mapped
+                    reason = "agg_alias" if len(agg_col_map[by]) == 1 else "agg_alias_priority"
+                    fixes["top_k.by"] = {"from": by, "to": mapped, "reason": reason}
 
         time_bucket = args.get("time_bucket") or {}
         if time_bucket:
@@ -216,6 +317,15 @@ class ToolExecutor:
             fix_field(ratio, "denominator", "ratios.denominator")
 
         return args, fixes
+
+    def _make_json_safe(self, value: Any) -> Any:
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, dict):
+            return {str(k): self._make_json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [self._make_json_safe(v) for v in value]
+        return str(value)
 
     def _execute_create_dataset(self, args: Any) -> Dict[str, Any]:
         """执行 create_dataset"""

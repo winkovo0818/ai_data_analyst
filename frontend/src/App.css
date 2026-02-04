@@ -208,21 +208,102 @@
 }
 
 /* 图表容器优化 */
-.chart-container-wrapper {
+.chart-display-container {
   margin-top: 16px;
-  background: #fff;
+  background: #ffffff;
   border-radius: 12px;
-  padding: 12px;
   border: 1px solid #e2e8f0;
-  box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  overflow: hidden;
   transition: all 0.3s ease;
-  width: 100%; /* 确保填满气泡 */
-  overflow: hidden; /* 防止溢出 */
+  width: 100%;
 }
 
-.chart-container-wrapper:hover {
-  box-shadow: 0 8px 16px rgba(0,0,0,0.08);
+.chart-display-container:hover {
+  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
   border-color: #cbd5e1;
+}
+
+.chart-header {
+  padding: 10px 16px;
+  border-bottom: 1px solid #f1f5f9;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #f8fafc;
+}
+
+.chart-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #334155;
+}
+
+.title-icon {
+  color: #4f46e5;
+  font-size: 16px;
+}
+
+.chart-content {
+  padding: 16px;
+  background: #ffffff;
+}
+
+.chart-fullscreen-modal .ant-modal-content {
+  padding: 24px;
+  border-radius: 16px;
+}
+
+.chart-fullscreen-modal .ant-modal-header {
+  margin-bottom: 24px;
+  border-bottom: none;
+}
+
+/* 表格容器优化 */
+.table-display-container {
+  margin-top: 16px;
+  background: #ffffff;
+  border-radius: 12px;
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  overflow: hidden;
+  transition: all 0.3s ease;
+}
+
+.table-header {
+  padding: 10px 16px;
+  border-bottom: 1px solid #f1f5f9;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #f8fafc;
+}
+
+.table-content {
+  padding: 0;
+}
+
+.custom-table .ant-table {
+  background: transparent;
+  font-size: 13px;
+}
+
+.custom-table .ant-table-thead > tr > th {
+  background: #f8fafc;
+  color: #64748b;
+  font-weight: 600;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.custom-table .ant-table-tbody > tr > td {
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.custom-table .ant-table-pagination {
+  margin: 12px 16px !important;
 }
 
 .chat-input-area {

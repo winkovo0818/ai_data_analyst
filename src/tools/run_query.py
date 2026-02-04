@@ -23,7 +23,7 @@ TOOL_DESCRIPTION = """
 - dataset_id: 数据集ID
 - filters: 过滤条件数组（可选）
   - col: 列名
-  - op: 操作符（=, !=, >, >=, <, <=, in, between, contains, like, is_null）
+  - op: 操作符（=, !=, >, >=, <, <=, in, between, contains, like, is_null, is_not_null）
   - value: 过滤值
 - group_by: 分组列名数组（可选）
 - aggregations: 聚合操作数组（可选）
@@ -36,7 +36,7 @@ TOOL_DESCRIPTION = """
   - as: 结果列名
 - having: 聚合后过滤条件数组（可选）
   - col: 列名（聚合别名/分组列）
-  - op: 操作符（=, !=, >, >=, <, <=, in, between, contains, like, is_null）
+  - op: 操作符（=, !=, >, >=, <, <=, in, between, contains, like, is_null, is_not_null）
   - value: 过滤值
 - top_k: Top K 规则（可选）
   - by: 排序列名
