@@ -7,12 +7,12 @@ from src.models.plot import PlotSpec, ChartOutput
 
 class PlotInput(BaseModel):
     """生成图表输入"""
-    chart_type: Optional[str] = Field("auto", description="图表类型: line, bar, pie, scatter, area, auto")
+    chart_type: Optional[str] = Field("auto", description="图表类型: line, bar, pie, scatter, area, heatmap, boxplot, auto")
     title: str = Field(..., description="图表标题")
     x: Optional[str] = Field(None, description="X轴列名")
     y: Optional[str] = Field(None, description="Y轴列名")
     series: Optional[str] = Field(None, description="系列分组列名")
-    y_format: Optional[Literal["number", "percent", "currency"]] = Field("number", description="Y轴格式")
+    y_format: Optional[Literal["number", "percent", "currency", "auto"]] = Field("auto", description="Y轴格式")
     data: Optional[Union[List[Dict[str, Any]], List[List[Any]]]] = Field(None, description="图表数据")
     columns: Optional[List[str]] = Field(None, description="列名（当 data/rows 为二维数组时使用）")
     rows: Optional[List[List[Any]]] = Field(None, description="行数据（可替代 data）")
@@ -45,12 +45,12 @@ TOOL_DESCRIPTION = """
 生成数据可视化图表。
 
 参数：
-- chart_type: 图表类型（line, bar, pie, scatter, area, auto）
+- chart_type: 图表类型（line, bar, pie, scatter, area, heatmap, boxplot, auto）
 - title: 图表标题
 - x: X轴列名（饼图不需要）
 - y: Y轴列名（饼图不需要）
 - series: 系列分组列名（可选，用于多系列图表）
-- y_format: Y轴格式（number, percent, currency）
+- y_format: Y轴格式（number, percent, currency, auto）
 - data: 图表数据（List[Dict] 或二维数组）
 - columns: 列名（当 data/rows 为二维数组时使用）
 - rows: 行数据（可替代 data，来自 run_query 的 rows）
@@ -67,6 +67,8 @@ TOOL_DESCRIPTION = """
 3. pie - 饼图（适合占比分析）
 4. scatter - 散点图（适合相关性分析）
 5. area - 面积图（适合趋势对比）
+6. heatmap - 热力图（适合二维分类对比）
+7. boxplot - 箱线图（适合分布与离群观察）
 
 使用场景：
 1. 趋势分析：使用折线图展示时间序列

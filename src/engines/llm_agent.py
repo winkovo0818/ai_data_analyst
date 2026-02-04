@@ -45,6 +45,15 @@ SYSTEM_PROMPT = """你是一个数据分析规划助手。
 - run_query 的 aggregations 参数是列表，每个元素包含 as, agg, col 三个字段
 - plot 工具需要传入 run_query 返回的数据（推荐 rows + columns）
 - resolve_fields 可以帮助你找到用户意图对应的真实字段名
+
+常用问题模板（可直接套用）：
+- 占比：各{维度}的{指标}占比/比例
+- TopK：按{维度}统计{指标} TopK
+- 同比/环比：按{时间}分桶，计算{指标}的同比/环比变化
+
+提示：
+- 占比/比例优先使用 ratios 或 derived 生成指标
+- 同比/环比优先用 time_bucket + 排序后计算；无法计算时说明限制并给替代方案
 """
 
 
@@ -271,12 +280,13 @@ class LLMAgent:
             x: str = None,
             y: str = None,
             series: str = None,
-            y_format: str = "number"
+            y_format: str = "auto"
         ) -> dict:
             """生成数据可视化图表
 
             Args:
-                chart_type: 图表类型，支持 line(折线图), bar(柱状图), pie(饼图), scatter(散点图), area(面积图)
+                chart_type: 图表类型，支持 line(折线图), bar(柱状图), pie(饼图), scatter(散点图), area(面积图),
+                    heatmap(热力图), boxplot(箱线图), auto(自动推荐)
                 title: 图表标题
                 data: 图表数据（List[Dict] 或二维数组）
                 columns: 列名（当 data/rows 为二维数组时使用）
@@ -284,7 +294,7 @@ class LLMAgent:
                 x: X轴列名（饼图不需要）
                 y: Y轴列名（饼图不需要）
                 series: 系列分组列名（可选，用于多系列图表）
-                y_format: Y轴格式，支持 number, percent, currency
+                y_format: Y轴格式，支持 number, percent, currency, auto
 
             Returns:
                 包含 ECharts option 的图表配置

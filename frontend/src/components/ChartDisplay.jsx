@@ -13,7 +13,7 @@ const ChartDisplay = ({ chart }) => {
         style={{ height: '400px', width: '100%' }}
         notMerge={true}
         lazyUpdate={true}
-        theme={"macarons"} 
+        theme={"light"}
       />
     </div>
   );

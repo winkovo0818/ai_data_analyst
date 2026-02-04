@@ -7,12 +7,12 @@ from src.core.constants import CHART_TYPES
 
 class PlotSpec(BaseModel):
     """图表规范"""
-    chart_type: str = Field(..., description="图表类型: line, bar, pie, scatter, area")
+    chart_type: str = Field(..., description="图表类型: line, bar, pie, scatter, area, heatmap, boxplot")
     title: str = Field(..., description="图表标题")
     x: Optional[str] = Field(None, description="X轴列名")
     y: Optional[str] = Field(None, description="Y轴列名")
     series: Optional[str] = Field(None, description="系列分组列名")
-    y_format: Optional[Literal["number", "percent", "currency"]] = Field("number", description="Y轴格式")
+    y_format: Optional[Literal["number", "percent", "currency", "auto"]] = Field("auto", description="Y轴格式")
     data: List[Dict[str, Any]] = Field(..., description="图表数据")
 
     def model_post_init(self, __context):

@@ -278,6 +278,17 @@ class ToolExecutor:
         y = payload.get("y")
         series = payload.get("series")
 
+        if payload.get("y_format") in (None, "auto") and x and y and chart_type not in (None, "auto"):
+            recommendation = self.plot_engine.recommend(
+                payload.get("data", []),
+                x=x,
+                y=y,
+                series=series
+            )
+            payload["y_format"] = recommendation.get("y_format", payload.get("y_format"))
+            if series is None:
+                payload["series"] = recommendation.get("series")
+
         if chart_type in (None, "auto") or not x or not y:
             recommendation = self.plot_engine.recommend(
                 payload.get("data", []),
@@ -293,6 +304,8 @@ class ToolExecutor:
                 payload["y"] = recommendation.get("y")
             if series is None:
                 payload["series"] = recommendation.get("series")
+            if payload.get("y_format") in (None, "auto"):
+                payload["y_format"] = recommendation.get("y_format", payload.get("y_format"))
 
         spec = PlotSpec(**payload)
         chart = self.plot_engine.generate(spec)

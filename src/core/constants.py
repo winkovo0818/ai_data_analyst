@@ -29,7 +29,7 @@ TIME_BUCKET_GRAINULARITIES: Set[str] = {
 
 # 图表类型
 CHART_TYPES: Set[str] = {
-    "line", "bar", "pie", "scatter", "area"
+    "line", "bar", "pie", "scatter", "area", "heatmap", "boxplot"
 }
 
 # 数据类型映射

@@ -35,6 +35,10 @@ class PlotEngine:
             option = self._generate_scatter_chart(spec)
         elif spec.chart_type == "area":
             option = self._generate_area_chart(spec)
+        elif spec.chart_type == "heatmap":
+            option = self._generate_heatmap_chart(spec)
+        elif spec.chart_type == "boxplot":
+            option = self._generate_boxplot_chart(spec)
         else:
             raise ValueError(f"不支持的图表类型: {spec.chart_type}")
 
@@ -86,6 +90,78 @@ class PlotEngine:
                     break
         return len(set(values))
 
+    def _collect_numeric_values(self, data: List[Dict[str, Any]], col: str, limit: int = 500) -> List[float]:
+        values = []
+        for row in data:
+            if col in row:
+                value = row.get(col)
+                if self._is_numeric(value):
+                    values.append(float(value))
+                    if len(values) >= limit:
+                        break
+        return values
+
+    def _avg_group_size(self, data: List[Dict[str, Any]], col: str) -> float:
+        counts: Dict[Any, int] = {}
+        for row in data:
+            if col in row:
+                key = row[col]
+                counts[key] = counts.get(key, 0) + 1
+        if not counts:
+            return 0
+        return sum(counts.values()) / len(counts)
+
+    def _infer_format(self, data: List[Dict[str, Any]], col: Optional[str]) -> str:
+        if not col:
+            return "number"
+        name = col.lower()
+        percent_keywords = ["率", "占比", "百分比", "percent", "ratio", "%"]
+        currency_keywords = ["金额", "价格", "成本", "收入", "销售额", "利润", "cost", "price", "revenue", "amount", "profit"]
+        if any(k in name for k in percent_keywords):
+            return "percent"
+        if any(k in name for k in currency_keywords):
+            return "currency"
+        values = self._collect_numeric_values(data, col)
+        if values:
+            vmin = min(values)
+            vmax = max(values)
+            if vmin >= 0 and vmax <= 1:
+                return "percent"
+        return "number"
+
+    def _percentile(self, values: List[float], p: float) -> float:
+        if not values:
+            return 0.0
+        sorted_vals = sorted(values)
+        if len(sorted_vals) == 1:
+            return sorted_vals[0]
+        k = (len(sorted_vals) - 1) * p
+        f = int(k)
+        c = min(f + 1, len(sorted_vals) - 1)
+        if f == c:
+            return sorted_vals[f]
+        return sorted_vals[f] + (sorted_vals[c] - sorted_vals[f]) * (k - f)
+
+    def _box_summary(self, values: List[float]) -> List[float]:
+        if not values:
+            return [0, 0, 0, 0, 0]
+        min_v = min(values)
+        max_v = max(values)
+        q1 = self._percentile(values, 0.25)
+        median = self._percentile(values, 0.5)
+        q3 = self._percentile(values, 0.75)
+        return [min_v, q1, median, q3, max_v]
+
+    def _base_option(self, title: str) -> Dict[str, Any]:
+        return {
+            "title": {"text": title, "left": "center"},
+            "color": ["#5470C6", "#91CC75", "#FAC858", "#EE6666", "#73C0DE", "#3BA272", "#FC8452", "#9A60B4", "#EA7CCC"],
+            "textStyle": {"fontFamily": "PingFang SC, Microsoft YaHei, Arial", "fontSize": 12},
+            "grid": {"left": 48, "right": 28, "top": 60, "bottom": 44, "containLabel": True},
+            "tooltip": {"confine": True},
+            "legend": {"top": 28}
+        }
+
     def recommend(
         self,
         data: List[Dict[str, Any]],
@@ -126,9 +202,11 @@ class PlotEngine:
         if series is None:
             candidates = [c for c in category_cols if c not in {x, y}]
             for c in candidates:
-                if self._unique_count(data, c) <= 10:
+                if self._unique_count(data, c) <= 12:
                     series = c
                     break
+
+        y_format = self._infer_format(data, y)
 
         chart_type = "bar"
         if x in numeric_cols and y in numeric_cols and x != y:
@@ -136,20 +214,35 @@ class PlotEngine:
             series = None
         elif x in datetime_cols:
             chart_type = "line"
-        elif series:
-            chart_type = "bar"
         else:
-            if x in category_cols and self._unique_count(data, x) <= 8:
-                chart_type = "pie"
+            x_unique = self._unique_count(data, x) if x else 0
+            series_unique = self._unique_count(data, series) if series else 0
+            if series and x in category_cols:
+                if x_unique * series_unique >= 60 or series_unique > 8 or x_unique > 20:
+                    chart_type = "heatmap"
+                else:
+                    chart_type = "bar"
+            else:
+                if x in category_cols:
+                    avg_group = self._avg_group_size(data, x)
+                    if y in numeric_cols and len(data) >= 80 and x_unique <= 12 and avg_group >= 5:
+                        chart_type = "boxplot"
+                    elif x_unique <= 8:
+                        chart_type = "pie"
+                    else:
+                        chart_type = "bar"
 
         if chart_type == "pie":
             series = None
+        if chart_type == "heatmap" and not series:
+            chart_type = "bar"
 
         return {
             "chart_type": chart_type,
             "x": x,
             "y": y,
-            "series": series
+            "series": series,
+            "y_format": y_format
         }
 
     def _build_series(self, spec: PlotSpec) -> Dict[str, Any]:
@@ -193,15 +286,15 @@ class PlotEngine:
         x_data = aligned["x_data"]
         series_data = aligned["series"]
 
-        # 构建 ECharts option
-        option = {
-            "title": {"text": spec.title},
-            "tooltip": {"trigger": "axis"},
-            "legend": {"data": list(series_data.keys())},
+        option = self._base_option(spec.title)
+        option.update({
+            "tooltip": {"trigger": "axis", "confine": True},
+            "legend": {"data": list(series_data.keys()), "top": 28},
             "xAxis": {
                 "type": "category",
                 "data": x_data,
-                "name": spec.x
+                "name": spec.x,
+                "axisLabel": {"interval": "auto"}
             },
             "yAxis": {
                 "type": "value",
@@ -213,11 +306,12 @@ class PlotEngine:
                     "name": name,
                     "type": "line",
                     "data": values,
-                    "smooth": True
+                    "smooth": True,
+                    "showSymbol": False
                 }
                 for name, values in series_data.items()
             ]
-        }
+        })
 
         return option
 
@@ -227,14 +321,15 @@ class PlotEngine:
         x_data = aligned["x_data"]
         series_data = aligned["series"]
 
-        option = {
-            "title": {"text": spec.title},
-            "tooltip": {"trigger": "axis"},
-            "legend": {"data": list(series_data.keys())},
+        option = self._base_option(spec.title)
+        option.update({
+            "tooltip": {"trigger": "axis", "confine": True},
+            "legend": {"data": list(series_data.keys()), "top": 28},
             "xAxis": {
                 "type": "category",
                 "data": x_data,
-                "name": spec.x
+                "name": spec.x,
+                "axisLabel": {"interval": "auto"}
             },
             "yAxis": {
                 "type": "value",
@@ -249,7 +344,7 @@ class PlotEngine:
                 }
                 for name, values in series_data.items()
             ]
-        }
+        })
 
         return option
 
@@ -269,10 +364,10 @@ class PlotEngine:
             for row in spec.data
         ]
 
-        option = {
-            "title": {"text": spec.title, "left": "center"},
-            "tooltip": {"trigger": "item"},
-            "legend": {"orient": "vertical", "left": "left"},
+        option = self._base_option(spec.title)
+        option.update({
+            "tooltip": {"trigger": "item", "confine": True},
+            "legend": {"orient": "vertical", "left": "left", "top": 48},
             "series": [
                 {
                     "type": "pie",
@@ -287,7 +382,7 @@ class PlotEngine:
                     }
                 }
             ]
-        }
+        })
 
         return option
 
@@ -298,18 +393,18 @@ class PlotEngine:
             raise ValueError("图表数据缺少必要字段")
         scatter_data = [[row[spec.x], row[spec.y]] for row in spec.data]
 
-        option = {
-            "title": {"text": spec.title},
-            "tooltip": {"trigger": "item"},
-            "xAxis": {"name": spec.x},
-            "yAxis": {"name": spec.y},
+        option = self._base_option(spec.title)
+        option.update({
+            "tooltip": {"trigger": "item", "confine": True},
+            "xAxis": {"name": spec.x, "type": "value"},
+            "yAxis": {"name": spec.y, "type": "value", "axisLabel": self._get_axis_formatter(spec.y_format)},
             "series": [
                 {
                     "type": "scatter",
                     "data": scatter_data
                 }
             ]
-        }
+        })
 
         return option
 
@@ -321,12 +416,120 @@ class PlotEngine:
             series["areaStyle"] = {}
         return option
 
+    def _generate_heatmap_chart(self, spec: PlotSpec) -> Dict[str, Any]:
+        """生成热力图"""
+        if not spec.x or not spec.y or not spec.series:
+            raise ValueError("热力图需要 x, y, series 字段")
+
+        x_values: List[Any] = []
+        y_values: List[Any] = []
+        x_index: Dict[Any, int] = {}
+        y_index: Dict[Any, int] = {}
+        heatmap_data: List[List[Any]] = []
+        min_val = None
+        max_val = None
+
+        for row in spec.data:
+            if spec.x not in row or spec.series not in row or spec.y not in row:
+                raise ValueError("图表数据缺少必要字段")
+            x_val = row[spec.x]
+            y_val = row[spec.series]
+            value = row[spec.y]
+
+            if x_val not in x_index:
+                x_index[x_val] = len(x_values)
+                x_values.append(x_val)
+            if y_val not in y_index:
+                y_index[y_val] = len(y_values)
+                y_values.append(y_val)
+
+            heatmap_data.append([x_index[x_val], y_index[y_val], value])
+
+            if self._is_numeric(value):
+                min_val = value if min_val is None else min(min_val, value)
+                max_val = value if max_val is None else max(max_val, value)
+
+        if min_val is None:
+            min_val, max_val = 0, 0
+
+        option = self._base_option(spec.title)
+        option.update({
+            "tooltip": {"position": "top", "confine": True},
+            "grid": {"left": 80, "right": 40, "top": 60, "bottom": 60, "containLabel": True},
+            "xAxis": {"type": "category", "data": x_values, "name": spec.x},
+            "yAxis": {"type": "category", "data": y_values, "name": spec.series},
+            "visualMap": {
+                "min": min_val,
+                "max": max_val,
+                "calculable": True,
+                "orient": "horizontal",
+                "left": "center",
+                "bottom": 10
+            },
+            "series": [
+                {
+                    "type": "heatmap",
+                    "data": heatmap_data,
+                    "emphasis": {
+                        "itemStyle": {
+                            "shadowBlur": 10,
+                            "shadowColor": "rgba(0, 0, 0, 0.3)"
+                        }
+                    }
+                }
+            ]
+        })
+
+        return option
+
+    def _generate_boxplot_chart(self, spec: PlotSpec) -> Dict[str, Any]:
+        """生成箱线图"""
+        if not spec.x or not spec.y:
+            raise ValueError("箱线图需要 x, y 字段")
+
+        grouped: Dict[Any, List[float]] = {}
+        for row in spec.data:
+            if spec.x not in row or spec.y not in row:
+                raise ValueError("图表数据缺少必要字段")
+            x_val = row[spec.x]
+            y_val = row[spec.y]
+            if self._is_numeric(y_val):
+                grouped.setdefault(x_val, []).append(float(y_val))
+
+        categories = list(grouped.keys())
+        box_data = [self._box_summary(grouped[cat]) for cat in categories]
+
+        option = self._base_option(spec.title)
+        option.update({
+            "tooltip": {"trigger": "item", "confine": True},
+            "xAxis": {
+                "type": "category",
+                "data": categories,
+                "name": spec.x,
+                "boundaryGap": True,
+                "axisLabel": {"interval": "auto", "rotate": 20}
+            },
+            "yAxis": {
+                "type": "value",
+                "name": spec.y,
+                "axisLabel": self._get_axis_formatter(spec.y_format)
+            },
+            "series": [
+                {
+                    "type": "boxplot",
+                    "data": box_data
+                }
+            ]
+        })
+
+        return option
+
     def _get_axis_formatter(self, format_type: str) -> Dict[str, Any]:
         """获取坐标轴格式化器"""
         if format_type == "percent":
             return {"formatter": "{value}%"}
         elif format_type == "currency":
-            return {"formatter": "${value}"}
+            return {"formatter": "¥{value}"}
         else:
             return {"formatter": "{value}"}
 
